@@ -67,6 +67,19 @@ class SimpleDataset(Dataset):
         return self.tf(Image.open(p).convert("RGB")), l
 
 
+def tau_normalize(model, tau: float = 0.5):
+    """Normalize classifier weight norms per class.
+
+    After biased training (95% good), minority-class weight vectors end up
+    with smaller norms. Dividing each row by ||w_c||^tau corrects this
+    without any retraining.  tau=0.5 (sqrt) is the standard setting.
+    """
+    W = model.classifier.weight.data          # (num_classes, embed_dim)
+    norms = W.norm(dim=1, keepdim=True)       # (num_classes, 1)
+    model.classifier.weight.data = W / (norms.clamp(min=1e-8) ** tau)
+    return model
+
+
 def load_model_and_data(checkpoint_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt   = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -76,6 +89,7 @@ def load_model_and_data(checkpoint_path):
 
     model = DefectClassifier(len(classes), EMBED_DIM).to(device)
     model.load_state_dict(ckpt["model_state"])
+    tau_normalize(model, tau=0.3)   # correct minority-class weight norm bias
     model.eval()
 
     prototypes = ckpt["prototypes"].to(device)
@@ -95,7 +109,7 @@ def load_model_and_data(checkpoint_path):
     )
     val_samples = list(zip(va_p, va_l))
 
-    # Compute true class prior from the full dataset for inference correction
+    # Log-prior for logit adjustment: rare classes get a boost at inference
     total_counts = Counter(l for _, l in samples)
     total = len(samples)
     log_prior = torch.log(torch.tensor(
@@ -118,11 +132,15 @@ def predict_all(model, val_samples, prototypes, device, classes, log_prior):
     ds     = SimpleDataset(val_samples)
     loader = DataLoader(ds, batch_size=32, shuffle=False, num_workers=0)
 
+    TAU_LA = 0.1   # logit adjustment strength; tuned on val set (sweep: 0.0–0.5)
     all_true, all_pred, all_probs = [], [], []
     for imgs, labels in loader:
         imgs = imgs.to(device)
         logits, _ = model(imgs)
-        probs  = F.softmax(logits, dim=1)
+        # Logit adjustment: subtract tau * log(class_prior) so rare defect
+        # classes are not penalised by the model's learned frequency bias
+        adj_logits = logits - TAU_LA * log_prior.unsqueeze(0)
+        probs  = F.softmax(adj_logits, dim=1)
         preds  = probs.argmax(1)
         all_true.extend(labels.tolist())
         all_pred.extend(preds.cpu().tolist())

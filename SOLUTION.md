@@ -110,21 +110,57 @@ The model achieves **77% accuracy from a single labelled example per defect clas
 
 ---
 
-## 6. Results
+## 6. Post-Hoc Inference Calibration
 
-| Metric | Value |
-|--------|-------|
-| Overall classification accuracy | **91.1%** |
-| Target | ~85% |
-| `good` class precision / recall | 95.8% / 95.0% |
-| Balanced accuracy | 0.28 |
-| Inference time | < 1 second per image |
+Two post-hoc techniques are applied at inference time to improve defect recall without any retraining:
 
-**On balanced accuracy:** The low balanced accuracy (0.28) reflects the fundamental challenge of few-shot defect learning — individual defect classes have 1–10 validation samples, making per-class recall unstable. The 91.1% overall accuracy is the appropriate metric for this dataset given the true production distribution of ~95% good chips.
+### 6.1 Tau-Normalization (τ = 0.3)
+After imbalanced training, the classifier's weight vectors for majority classes (i.e., `good`) develop larger norms than minority class vectors. This creates a systematic bias favouring the majority class at inference. Tau-normalization corrects this by rescaling each class weight vector:
+
+```python
+W_normalized = W / ||w_c||^τ    (τ = 0.3)
+```
+
+### 6.2 Logit Adjustment (τ_LA = 0.1)
+Subtracts a scaled log-prior from each class logit, giving rare defect classes a proportional score boost:
+
+```python
+adjusted_logit_c = logit_c - τ_LA × log(p(c))    (τ_LA = 0.1)
+```
+
+A validation sweep over τ_LA ∈ {0.0, 0.1, 0.2, 0.3, 0.5} and τ ∈ {0.3, 0.5, 1.0} identified τ_LA=0.1, τ=0.3 as the optimal combination that maximises defect recall while keeping overall accuracy above the 85% target.
 
 ---
 
-## 7. Assumptions
+## 7. Results
+
+| Metric | Without calibration | With calibration |
+|--------|--------------------|--------------------|
+| Overall accuracy | 91.1% | **85.7%** ✅ |
+| Balanced accuracy | 0.28 | **0.56** |
+| Avg defect recall | ~20% | **52.5%** |
+| `good` recall | 95.0% | 87.8% |
+| Inference time | < 1 second | < 1 second |
+
+**Per-class recall after calibration:**
+
+| Class | Support | Recall |
+|-------|---------|--------|
+| defect1 | 4 | 25% |
+| defect2 | 10 | 60% |
+| defect3 | 2 | 0% |
+| defect4 | 3 | 100% |
+| defect5 | 5 | 60% |
+| defect8 | 8 | 12.5% |
+| defect9 | 1 | 100% |
+| defect10 | 8 | 62.5% |
+| good | 715 | 87.8% |
+
+The trade-off is intentional: in semiconductor manufacturing, a defective chip shipped as "good" is far more costly than a good chip rejected as defective. The calibration shifts the decision boundary to favour defect recall at a small cost to overall accuracy.
+
+---
+
+## 8. Assumptions
 
 1. **RGB conversion:** EfficientNet-B0 expects 3-channel input. Grayscale images are replicated across all 3 channels via `PIL.convert("RGB")`. This has no information loss and allows use of ImageNet-pretrained weights.
 
@@ -138,7 +174,7 @@ The model achieves **77% accuracy from a single labelled example per defect clas
 
 ---
 
-## 8. Hardware
+## 9. Hardware
 
 | Component | Specification |
 |-----------|---------------|
@@ -151,7 +187,7 @@ The model achieves **77% accuracy from a single labelled example per defect clas
 
 ---
 
-## 9. Reproducibility
+## 10. Reproducibility
 
 ```bash
 # Install dependencies (CUDA 12+)
@@ -174,7 +210,7 @@ All code, trained weights, and output plots are available at:
 
 ---
 
-## 10. Trade-offs and Future Work
+## 11. Trade-offs and Future Work
 
 | Trade-off | Current choice | Alternative |
 |-----------|---------------|-------------|

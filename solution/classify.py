@@ -89,10 +89,18 @@ class DefectClassificationApp:
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()
 
-        self.prototypes = ckpt["prototypes"].to(self.device)  # (C, D)
+        self.prototypes     = ckpt["prototypes"].to(self.device)  # (C, D)
+        self.base_classes   = list(self.classes)   # classes known at train time
+        self.extra_classes  = []                   # classes registered at runtime
 
-        # Prior correction: compensate for WeightedRandomSampler training bias
-        cc = ckpt.get("class_counts", {c: 1 for c in self.classes})
+        # Tau-normalization: correct minority-class weight-norm bias from
+        # imbalanced training (defect class weights end up smaller than good)
+        W     = self.model.classifier.weight.data
+        norms = W.norm(dim=1, keepdim=True)
+        self.model.classifier.weight.data = W / (norms.clamp(min=1e-8) ** 0.3)
+
+        # Logit adjustment prior: rare classes get a boost at inference
+        cc    = ckpt.get("class_counts", {c: 1 for c in self.classes})
         total = sum(cc.values()) or 1
         prior = torch.tensor(
             [cc.get(c, 1) / total for c in self.classes],
@@ -130,11 +138,30 @@ class DefectClassificationApp:
           "infer_ms":   float, # inference time in ms
         }
         """
-        t0 = time.time()
-        img   = Image.open(image_path).convert("RGB")
-        embed = self._embed(img)                             # (1, D)
-        sim   = torch.mm(embed, self.prototypes.T)                        # (1, C) cosine sims
-        probs = F.softmax(sim * 12 + self.log_prior, dim=1).squeeze(0)   # prior-corrected
+        t0  = time.time()
+        img = Image.open(image_path).convert("RGB")
+
+        if self.extra_classes:
+            # Hybrid: classifier head for base classes, prototype for new ones
+            embed      = self._embed(img)                          # (1, D)
+            t          = _PREPROCESS(img).unsqueeze(0).to(self.device)
+            logits, _  = self.model(t)                             # (1, C_base)
+            adj        = logits - 0.1 * self.log_prior.unsqueeze(0) # logit adjustment
+            base_probs = F.softmax(adj, dim=1).squeeze(0)
+
+            extra_protos = self.prototypes[len(self.base_classes):]
+            extra_sim    = torch.mm(embed, extra_protos.T).squeeze(0)
+            extra_probs  = F.softmax(extra_sim * 12, dim=0)
+
+            # Scale to comparable range and concatenate
+            probs = torch.cat([base_probs, extra_probs * base_probs.max()])
+        else:
+            # Fast path: classifier head + logit adjustment
+            t         = _PREPROCESS(img).unsqueeze(0).to(self.device)
+            logits, _ = self.model(t)
+            adj       = logits - 0.1 * self.log_prior.unsqueeze(0)
+            probs     = F.softmax(adj, dim=1).squeeze(0)
+
         pred_idx   = probs.argmax().item()
         pred_class = self.classes[pred_idx]
         confidence = probs[pred_idx].item()
@@ -160,6 +187,7 @@ class DefectClassificationApp:
             self.classes.append(class_name)
             self.class2idx[class_name] = new_idx
             self.num_classes += 1
+            self.extra_classes.append(class_name)
             # Expand prototypes matrix
             new_row = torch.zeros(1, EMBED_DIM, device=self.device)
             self.prototypes = torch.cat([self.prototypes, new_row], dim=0)

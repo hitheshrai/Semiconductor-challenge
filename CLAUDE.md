@@ -110,3 +110,4 @@ Run the relevant script after every meaningful change. Never report done without
 |------|-------------|
 | agent_docs/hyperparameters.md | Tuning, training runs, loss/accuracy analysis |
 | agent_docs/history.md | Understanding prior run failures and fixes |
+| agent_docs/improvement_strategies.md | Next steps: cRT, Focal Loss, MAE pretraining |

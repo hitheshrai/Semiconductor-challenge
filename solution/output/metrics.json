@@ -1,17 +1,17 @@
 {
-  "balanced_accuracy": 0.2824,
-  "macro_f1": 0.2995,
+  "balanced_accuracy": 0.5643,
+  "macro_f1": 0.4104,
   "per_class": {
     "defect1": {
-      "precision": 0.0,
-      "recall": 0.0,
-      "f1": 0.0,
+      "precision": 0.1111,
+      "recall": 0.25,
+      "f1": 0.1538,
       "support": 4
     },
     "defect2": {
-      "precision": 0.5,
+      "precision": 0.375,
       "recall": 0.6,
-      "f1": 0.5455,
+      "f1": 0.4615,
       "support": 10
     },
     "defect3": {
@@ -21,39 +21,39 @@
       "support": 2
     },
     "defect4": {
-      "precision": 1.0,
-      "recall": 0.6667,
-      "f1": 0.8,
+      "precision": 0.75,
+      "recall": 1.0,
+      "f1": 0.8571,
       "support": 3
     },
     "defect5": {
-      "precision": 0.5,
-      "recall": 0.2,
-      "f1": 0.2857,
+      "precision": 0.2727,
+      "recall": 0.6,
+      "f1": 0.375,
       "support": 5
     },
     "defect8": {
-      "precision": 0.1,
+      "precision": 0.0476,
       "recall": 0.125,
-      "f1": 0.1111,
+      "f1": 0.069,
       "support": 8
     },
     "defect9": {
-      "precision": 0.0,
-      "recall": 0.0,
-      "f1": 0.0,
+      "precision": 0.5,
+      "recall": 1.0,
+      "f1": 0.6667,
       "support": 1
     },
     "defect10": {
-      "precision": 0.0,
-      "recall": 0.0,
-      "f1": 0.0,
+      "precision": 0.1111,
+      "recall": 0.625,
+      "f1": 0.1887,
       "support": 8
     },
     "good": {
-      "precision": 0.9577,
-      "recall": 0.9497,
-      "f1": 0.9537,
+      "precision": 0.9691,
+      "recall": 0.8783,
+      "f1": 0.9215,
       "support": 715
     }
   }

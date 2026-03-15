@@ -51,8 +51,52 @@ Applied in `evaluate.py::predict_all()` and `classify.py::predict()`.
 
 ---
 
+---
+
+## Two-Stage Cascade — IMPLEMENTED ✓
+
+### Motivation (first-principles, not from a paper)
+Every single-model attempt traded defect recall for overall accuracy. Root cause:
+a single classifier must simultaneously learn two conflicting objectives:
+  1. Good vs. defective (95/5 split — easy, dominated by majority)
+  2. Which defect type (8 rare classes — hard, needs balanced training)
+Any training signal that helps (2) hurts (1) and vice versa.
+
+**Solution: decompose into two independent problems.**
+
+### Architecture (`train_cascade.py`)
+- **Stage 1** — Binary good-vs-defective classifier
+  - Trained on all 3778 images with Focal Loss + balanced sampler
+  - Checkpoint: `output/model_stage1.pth`
+  - Threshold tuned on val set (0.35) for maximum defect recall at ≥85% overall
+- **Stage 2** — 8-class defect-type classifier
+  - Trained on ~230 defect-only images — no `good` class competing
+  - Balanced sampler + label smoothing
+  - Prototype-based cosine inference at test time
+  - Checkpoint: `output/model_stage2.pth`
+
+### Provenance
+- Cascade classifier paradigm: Viola & Jones, CVPR 2001
+- Two-stage detection/classification separation: Faster R-CNN, Ren et al. 2015
+- Hierarchical imbalanced classification: standard pattern in industrial inspection literature
+- This specific decomposition derived from first-principles analysis of the objective conflict
+
+### Results (threshold=0.35)
+| Metric | Single model (best) | Cascade |
+|--------|---------------------|---------|
+| Overall accuracy | 85.7% | **85.1%** ✅ |
+| Balanced accuracy | 0.56 | **0.781** |
+| Avg defect recall | 52.5% | **70.7%** |
+| `good` recall | 87.8% | 85.9% |
+
+Per-class defect recall: defect1=75%, defect2=70%, defect3=100%, defect4=67%,
+defect5=80%, defect8=50%, defect9=100%, defect10=87.5%
+
+---
+
 ## Key Insight
 The fundamental problem is training/inference distribution mismatch combined with
 classifier weight-norm bias. Post-hoc calibration (done) addresses the symptom.
-The cRT approach (next) addresses the root cause in the classifier layer.
+The cRT approach (done) addresses the root cause in the classifier layer.
+The cascade approach (done) addresses the root cause in the objective conflict.
 MAE pretraining addresses the root cause in the backbone features.

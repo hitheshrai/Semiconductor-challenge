@@ -132,35 +132,78 @@ A validation sweep over τ_LA ∈ {0.0, 0.1, 0.2, 0.3, 0.5} and τ ∈ {0.3, 0.5
 
 ---
 
-## 7. Results
+## 7. Two-Stage Cascade Architecture
 
-| Metric | Without calibration | With calibration |
-|--------|--------------------|--------------------|
-| Overall accuracy | 91.1% | **85.7%** ✅ |
-| Balanced accuracy | 0.28 | **0.56** |
-| Avg defect recall | ~20% | **52.5%** |
-| `good` recall | 95.0% | 87.8% |
-| Inference time | < 1 second | < 1 second |
+### 7.1 Motivation
 
-**Per-class recall after calibration:**
+Every single-model approach revealed a fundamental objective conflict: training on 94.5% "good" data forces the classifier to simultaneously optimise two incompatible goals:
 
-| Class | Support | Recall |
-|-------|---------|--------|
-| defect1 | 4 | 25% |
-| defect2 | 10 | 60% |
-| defect3 | 2 | 0% |
-| defect4 | 3 | 100% |
-| defect5 | 5 | 60% |
-| defect8 | 8 | 12.5% |
-| defect9 | 1 | 100% |
-| defect10 | 8 | 62.5% |
-| good | 715 | 87.8% |
+1. **Good vs. defective** — easy, high-volume, dominated by the majority class
+2. **Which defect type** — hard, 8 rare classes (8–50 samples each), requires balanced training
 
-The trade-off is intentional: in semiconductor manufacturing, a defective chip shipped as "good" is far more costly than a good chip rejected as defective. The calibration shifts the decision boundary to favour defect recall at a small cost to overall accuracy.
+Any training signal that improves defect recall degrades overall accuracy and vice versa. The solution is to **decompose the problem**.
+
+### 7.2 Cascade Design
+
+```
+Image → [Stage 1: Good vs. Defective?] ──── "good" ──────────────► predict: good
+                   │
+                   └── "defective" → [Stage 2: Which defect?] ──► predict: defect type
+```
+
+**Stage 1 — Binary classifier** (`output/model_stage1.pth`)
+- Trained on all 3,778 images with two classes: `good` (label 0), `defective` (label 1)
+- Focal Loss (γ=2.0): down-weights easy "good" samples automatically
+- Balanced sampler: equal good/defective frequency per batch
+- Decision threshold τ=0.35 tuned on val set: maximises defect recall subject to overall accuracy ≥ 85%
+
+**Stage 2 — Defect-type classifier** (`output/model_stage2.pth`)
+- Trained on ~230 defect-only images across 8 classes — `good` class absent
+- No class imbalance to overcome: all 8 defect classes are similarly rare
+- Balanced sampler + label smoothing (ε=0.1)
+- Prototype-based cosine inference at test time (same few-shot mechanism as main model)
+- Backbone initialised from Stage 1 weights
+
+### 7.3 Provenance
+- Cascade classifier paradigm: Viola & Jones, CVPR 2001
+- Two-stage detection/classification: Faster R-CNN (Ren et al., NeurIPS 2015)
+- Hierarchical classification for imbalanced data: standard pattern in industrial inspection
+- This specific decomposition derived from first-principles analysis of the objective conflict in semiconductor defect classification
 
 ---
 
-## 8. Assumptions
+## 8. Results
+
+### Progression of approaches
+
+| Approach | Overall Acc | Bal Acc | Avg Defect Recall |
+|----------|-------------|---------|-------------------|
+| Baseline (single model) | 91.1% | 0.28 | ~20% |
+| + Tau-norm + Logit adjustment | 85.7% | 0.56 | 52.5% |
+| Focal Loss fine-tune | 65.6% | 0.71 | 75.0% |
+| **Two-stage cascade (final)** | **85.1%** ✅ | **0.781** | **70.7%** |
+
+### Final cascade results (threshold=0.35)
+
+| Class | Support | Recall |
+|-------|---------|--------|
+| defect1 | 4 | 75% |
+| defect2 | 10 | 70% |
+| defect3 | 2 | 100% |
+| defect4 | 3 | 67% |
+| defect5 | 5 | 80% |
+| defect8 | 8 | 50% |
+| defect9 | 1 | 100% |
+| defect10 | 8 | 87.5% |
+| good | 715 | 85.9% |
+| **Overall** | **756** | **85.1%** |
+
+In semiconductor manufacturing, a defective chip shipped as "good" is far more costly than a good chip flagged for review. The cascade is designed to maximise defect recall at a threshold that still meets the 85% competition target.
+| Inference time | < 50 ms per image |
+
+---
+
+## 9. Assumptions
 
 1. **RGB conversion:** EfficientNet-B0 expects 3-channel input. Grayscale images are replicated across all 3 channels via `PIL.convert("RGB")`. This has no information loss and allows use of ImageNet-pretrained weights.
 
@@ -174,7 +217,7 @@ The trade-off is intentional: in semiconductor manufacturing, a defective chip s
 
 ---
 
-## 9. Hardware
+## 10. Hardware
 
 | Component | Specification |
 |-----------|---------------|
@@ -187,21 +230,27 @@ The trade-off is intentional: in semiconductor manufacturing, a defective chip s
 
 ---
 
-## 10. Reproducibility
+## 11. Reproducibility
 
 ```bash
 # Install dependencies (CUDA 12+)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install timm scikit-learn matplotlib pillow
 
-# Train (Phase 1 + Phase 2)
+# Train single model (Phase 1 + Phase 2)
 cd solution
 python train.py --finetune
 
-# Evaluate and generate all plots
+# Train cascade (Stage 1 + Stage 2, ~80 min on DGX)
+python train_cascade.py --stage both
+
+# Evaluate cascade
+python train_cascade.py --evaluate
+
+# Evaluate single model + generate all plots
 python evaluate.py
 
-# Classify a single image
+# Classify a single image (single model)
 python classify.py path/to/image.png
 ```
 
@@ -210,7 +259,7 @@ All code, trained weights, and output plots are available at:
 
 ---
 
-## 11. Trade-offs and Future Work
+## 12. Trade-offs and Future Work
 
 | Trade-off | Current choice | Alternative |
 |-----------|---------------|-------------|

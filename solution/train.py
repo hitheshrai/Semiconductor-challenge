@@ -138,9 +138,37 @@ def get_transform(train: bool):
 # ─────────────────────────────────────────────────────────────────────────────
 # Training helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def make_weighted_sampler(labels):
+class FocalLoss(nn.Module):
+    """Focal Loss (Lin et al., 2017) for class-imbalanced training.
+
+    Down-weights easy (high-confidence) predictions so the model focuses on
+    hard misclassified examples — naturally suppresses the dominant 'good'
+    class without needing aggressive sampling.
+
+    gamma=2.0 is the standard setting from the original paper.
+    """
+    def __init__(self, gamma: float = 2.0, weight=None, label_smoothing: float = 0.05):
+        super().__init__()
+        self.gamma           = gamma
+        self.weight          = weight
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, weight=self.weight,
+                             label_smoothing=self.label_smoothing, reduction="none")
+        pt = torch.exp(-ce)                        # probability of correct class
+        focal_weight = (1 - pt) ** self.gamma      # down-weight easy examples
+        return (focal_weight * ce).mean()
+
+
+def make_weighted_sampler(labels, power: float = 1.0):
+    """Weighted sampler with configurable exponent.
+
+    power=1.0  → full inverse-frequency (equal class frequency per batch)
+    power=0.5  → sqrt weighting (softer — defects oversampled but 'good' not excluded)
+    """
     counts = Counter(labels)
-    weights = [1.0 / counts[l] for l in labels]
+    weights = [1.0 / (counts[l] ** power) for l in labels]
     return WeightedRandomSampler(weights, num_samples=len(labels), replacement=True)
 
 
@@ -207,7 +235,17 @@ def main():
     ap.add_argument("--epochs", type=int, default=None,
                     help="Override Phase 1 epochs (default: 20)")
     ap.add_argument("--phase2-epochs", type=int, default=None,
-                    help="Override Phase 2 epochs (default: 20)")
+                    help="Override Phase 2 epochs (default: 40)")
+    ap.add_argument("--crt", action="store_true",
+                    help="Decoupled Classifier Retraining: freeze backbone+head, "
+                         "reinit classifier, train with balanced sampling (~30 epochs).")
+    ap.add_argument("--crt-epochs", type=int, default=30,
+                    help="Epochs for cRT (default: 30)")
+    ap.add_argument("--focal", action="store_true",
+                    help="Focal Loss fine-tune: unfreeze full backbone, "
+                         "Focal Loss (gamma=2) + sqrt sampler, checkpoint on bal_acc.")
+    ap.add_argument("--focal-epochs", type=int, default=50,
+                    help="Epochs for Focal Loss fine-tune (default: 50)")
     args = ap.parse_args()
 
     if args.epochs:
@@ -272,6 +310,138 @@ def main():
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR_HEAD, weight_decay=1e-4,
     )
+
+    if args.crt:
+        # ════════════════════════════════════════════════════════════════════
+        # cRT — Decoupled Classifier Retraining (Kang et al., ICLR 2020)
+        # Freeze backbone + embedding head entirely. Re-init only the final
+        # linear classifier. Train with balanced sampling so every class is
+        # seen equally — the backbone features are already good; only the
+        # decision boundary needs fixing.
+        # ════════════════════════════════════════════════════════════════════
+        if not CHECKPOINT.exists():
+            print(f"ERROR: No checkpoint at {CHECKPOINT}. Run Phase 1+2 first.")
+            return
+
+        print(f"\n{'='*60}")
+        print(f" cRT: Decoupled Classifier Retraining  ({args.crt_epochs} epochs)")
+        print(f"{'='*60}")
+
+        ckpt = torch.load(CHECKPOINT, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+
+        # Freeze everything except the classifier head
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+        for p in model.embed_head.parameters():
+            p.requires_grad = False
+
+        # Re-initialise classifier with unbiased weights
+        nn.init.normal_(model.classifier.weight, mean=0.0, std=0.01)
+
+        # Balanced sampler: equal frequency per class — this is the key
+        # difference from normal training. No class-weighted loss needed.
+        crt_loader = DataLoader(
+            tr_ds, batch_size=BATCH_SIZE,
+            sampler=make_weighted_sampler(tr_l, power=1.0),
+            num_workers=0, pin_memory=False,
+        )
+        crt_criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+        crt_opt = torch.optim.AdamW(
+            model.classifier.parameters(), lr=LR_HEAD, weight_decay=1e-3,
+        )
+        crt_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            crt_opt, T_max=args.crt_epochs, eta_min=1e-6,
+        )
+
+        best_bal = 0.0
+        for ep in range(args.crt_epochs):
+            t0 = time.time()
+            tr_loss, tr_acc, _, _, _ = run_epoch(
+                model, crt_loader, crt_opt, crt_criterion, device, True)
+            va_loss, va_acc, va_bal, vp, vl = run_epoch(
+                model, va_loader, crt_opt, crt_criterion, device, False)
+            crt_sched.step()
+            print(f"  ep {ep+1:02d}/{args.crt_epochs}  loss {tr_loss:.4f}/{va_loss:.4f}  "
+                  f"acc {tr_acc:.3f}/{va_acc:.3f}  bal_acc {va_bal:.3f}  "
+                  f"({time.time()-t0:.1f}s)")
+            if va_bal > best_bal:
+                best_bal = va_bal
+                _save(model, ep, va_bal, CHECKPOINT, train_samples, device)
+                print(f"    ✓ New best bal-acc = {va_bal:.4f}")
+
+        print(f"\nBest balanced accuracy: {best_bal:.4f}")
+        _finish(model, history, best_bal, CHECKPOINT, train_samples, device,
+                va_loader, crt_opt, crt_criterion, all_samples=samples)
+        return
+
+    if args.focal:
+        # ════════════════════════════════════════════════════════════════════
+        # Focal Loss fine-tune — full backbone unfrozen, soft sqrt sampler
+        #
+        # Why this works better than cRT:
+        #   cRT's balanced sampler (1/count) forces equal class frequency,
+        #   which collapses 'good' recall.  Focal Loss handles imbalance via
+        #   the loss: easy 'good' samples contribute near-zero gradient, so
+        #   the model naturally focuses on hard defect cases.  Sqrt sampler
+        #   gives defects 2–10× more exposure than raw frequency without
+        #   completely starving 'good'.
+        # ════════════════════════════════════════════════════════════════════
+        if not CHECKPOINT.exists():
+            print(f"ERROR: No checkpoint at {CHECKPOINT}. Run Phase 1+2 first.")
+            return
+
+        print(f"\n{'='*60}")
+        print(f" Focal Loss fine-tune  ({args.focal_epochs} epochs)")
+        print(f"{'='*60}")
+
+        ckpt = torch.load(CHECKPOINT, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        model.unfreeze_backbone(last_n_blocks=7)   # unfreeze full backbone
+
+        # Sqrt-weighted sampler: softer than cRT's full 1/count
+        focal_loader = DataLoader(
+            tr_ds, batch_size=BATCH_SIZE,
+            sampler=make_weighted_sampler(tr_l, power=0.5),
+            num_workers=0, pin_memory=False,
+        )
+
+        # Mild class weights on top of focal — just 3:1 cap, not 15:1
+        cw_focal = class_weights_tensor(tr_l, NUM_CLASSES, device, max_ratio=3.0)
+        focal_criterion = FocalLoss(gamma=2.0, weight=cw_focal, label_smoothing=0.05)
+
+        focal_opt = torch.optim.AdamW([
+            {"params": model.backbone.parameters(),   "lr": LR_BACK},
+            {"params": model.embed_head.parameters(), "lr": LR_HEAD},
+            {"params": model.classifier.parameters(), "lr": LR_HEAD},
+        ], weight_decay=1e-4)
+        focal_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            focal_opt, T_max=args.focal_epochs, eta_min=1e-6,
+        )
+
+        focal_history = {k: [] for k in ("tr_loss", "va_loss", "tr_acc", "va_acc", "va_bal")}
+        best_bal = 0.0
+        for ep in range(args.focal_epochs):
+            t0 = time.time()
+            tr_loss, tr_acc, _, _, _ = run_epoch(
+                model, focal_loader, focal_opt, focal_criterion, device, True)
+            va_loss, va_acc, va_bal, vp, vl = run_epoch(
+                model, va_loader, focal_opt, focal_criterion, device, False)
+            focal_sched.step()
+            _log(focal_history, tr_loss, va_loss, tr_acc, va_acc, va_bal)
+            print(f"  ep {ep+1:02d}/{args.focal_epochs}  loss {tr_loss:.4f}/{va_loss:.4f}  "
+                  f"acc {tr_acc:.3f}/{va_acc:.3f}  bal_acc {va_bal:.3f}  "
+                  f"({time.time()-t0:.1f}s)")
+            # Save on balanced accuracy — what matters for defect recall
+            if va_bal > best_bal:
+                best_bal = va_bal
+                _save(model, ep, va_bal, CHECKPOINT, train_samples, device)
+                print(f"    ✓ New best bal-acc = {va_bal:.4f}  (overall={va_acc:.4f})")
+
+        print(f"\nBest balanced accuracy: {best_bal:.4f}")
+        _finish(model, focal_history, best_bal, CHECKPOINT, train_samples, device,
+                va_loader, focal_opt, focal_criterion, all_samples=samples)
+        return
 
     if args.phase2_only:
         # ── Load existing Phase 1 checkpoint, skip to Phase 2 ────────────

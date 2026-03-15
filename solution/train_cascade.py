@@ -53,6 +53,16 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, str(Path(__file__).parent))
 from model import DefectClassifier, compute_prototypes, EMBED_DIM
 
+# ViT backbone — imported lazily so train_cascade works without MAE checkpoint
+_USE_VIT = False
+def _make_model(num_classes: int):
+    """Model factory — returns ViTDefectClassifier if --vit, else DefectClassifier."""
+    if _USE_VIT:
+        from model_vit import ViTDefectClassifier
+        from train_mae import MAE_CKPT
+        return ViTDefectClassifier(num_classes, EMBED_DIM, mae_ckpt=MAE_CKPT)
+    return DefectClassifier(num_classes, EMBED_DIM)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,7 +251,7 @@ def train_stage1(epochs: int = 30, device=None):
                            sampler=balanced_sampler(tr_l), num_workers=0)
     va_loader = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    model = DefectClassifier(num_classes=2, embed_dim=EMBED_DIM).to(device)
+    model = _make_model(2).to(device)
     load_backbone(model, CKPT_INIT, device)
     model.unfreeze_backbone(last_n_blocks=7)   # full backbone
 
@@ -297,7 +307,7 @@ def _tune_threshold(device):
     if not CKPT_STAGE1.exists():
         return
     ckpt   = torch.load(CKPT_STAGE1, map_location=device, weights_only=False)
-    model  = DefectClassifier(num_classes=2, embed_dim=EMBED_DIM).to(device)
+    model  = _make_model(2).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -362,7 +372,7 @@ def train_stage2(epochs: int = 40, device=None):
                            sampler=balanced_sampler(tr_l), num_workers=0)
     va_loader = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    model = DefectClassifier(num_classes=NUM_DEFECTS, embed_dim=EMBED_DIM).to(device)
+    model = _make_model(NUM_DEFECTS).to(device)
     # Initialise from Stage 1 backbone — it already learned good defect features
     src = CKPT_STAGE1 if CKPT_STAGE1.exists() else CKPT_INIT
     load_backbone(model, src, device)
@@ -412,7 +422,7 @@ def _save_stage2(model, epoch, val_bal, train_samples, device):
 
 def _report_stage2(device):
     ckpt  = torch.load(CKPT_STAGE2, map_location=device, weights_only=False)
-    model = DefectClassifier(num_classes=NUM_DEFECTS, embed_dim=EMBED_DIM).to(device)
+    model = _make_model(NUM_DEFECTS).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -451,14 +461,14 @@ def evaluate_cascade(device):
 
     # Load Stage 1
     ckpt1   = torch.load(CKPT_STAGE1, map_location=device, weights_only=False)
-    model1  = DefectClassifier(num_classes=2, embed_dim=EMBED_DIM).to(device)
+    model1  = _make_model(2).to(device)
     model1.load_state_dict(ckpt1["model_state"])
     model1.eval()
     threshold = ckpt1.get("threshold", 0.5)
 
     # Load Stage 2
     ckpt2   = torch.load(CKPT_STAGE2, map_location=device, weights_only=False)
-    model2  = DefectClassifier(num_classes=NUM_DEFECTS, embed_dim=EMBED_DIM).to(device)
+    model2  = _make_model(NUM_DEFECTS).to(device)
     model2.load_state_dict(ckpt2["model_state"])
     model2.eval()
     protos2 = ckpt2["prototypes"].to(device)
@@ -550,11 +560,19 @@ def main():
                     help="Evaluate cascade on val set (requires both checkpoints)")
     ap.add_argument("--stage1-epochs", type=int, default=30)
     ap.add_argument("--stage2-epochs", type=int, default=40)
+    ap.add_argument("--vit", action="store_true",
+                    help="Use MAE-pretrained ViT-Small backbone instead of EfficientNet-B0. "
+                         "Requires train_mae.py to have been run first.")
     args = ap.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    if args.vit:
+        import train_cascade as _self
+        _self._USE_VIT = True
+        print("Backbone: MAE-pretrained ViT-Small/16")
 
     if args.evaluate:
         evaluate_cascade(device)

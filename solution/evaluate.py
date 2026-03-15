@@ -121,9 +121,8 @@ def predict_all(model, val_samples, prototypes, device, classes, log_prior):
     all_true, all_pred, all_probs = [], [], []
     for imgs, labels in loader:
         imgs = imgs.to(device)
-        embeds = model.get_embedding(imgs)
-        sim    = torch.mm(embeds, prototypes.T)
-        probs  = F.softmax(sim * 12 + log_prior, dim=1)
+        logits, _ = model(imgs)
+        probs  = F.softmax(logits, dim=1)
         preds  = probs.argmax(1)
         all_true.extend(labels.tolist())
         all_pred.extend(preds.cpu().tolist())

@@ -61,12 +61,12 @@ CHECKPOINT  = OUTPUT_DIR / "model_best.pth"
 IMG_SIZE   = 224
 BATCH_SIZE = 32   # larger batch = faster on CPU
 PHASE1_EP  = 20   # frozen backbone — fast on CPU (~20–30 min total)
-PHASE2_EP  = 20   # unfreeze last 3 blocks — only used with --finetune
+PHASE2_EP  = 40   # unfreeze last 3 blocks — only used with --finetune
 LR_HEAD    = 3e-4
 LR_BACK    = 3e-5  # 10× lower for backbone
 SEED       = 42
 
-CLASSES    = ["defect1", "defect5", "defect8", "defect9", "defect10", "good"]
+CLASSES    = ["defect1", "defect2", "defect3", "defect4", "defect5", "defect8", "defect9", "defect10", "good"]
 NUM_CLASSES = len(CLASSES)
 CLASS2IDX   = {c: i for i, c in enumerate(CLASSES)}
 
@@ -144,15 +144,18 @@ def make_weighted_sampler(labels):
     return WeightedRandomSampler(weights, num_samples=len(labels), replacement=True)
 
 
-def class_weights_tensor(labels, num_classes, device, max_ratio: float = 5.0):
+def class_weights_tensor(labels, num_classes, device, max_ratio: float = 15.0):
     """Inverse-frequency class weights, capped so no class is penalised
     more than ``max_ratio`` × the majority class.
 
     WHY: WeightedRandomSampler already equalises batch frequency across
-    classes.  Without capping, the raw inverse-frequency weights reach
-    476 : 1 (defect9 vs good), which teaches the model to *never* predict
-    "good".  A 5 : 1 cap keeps the minority emphasis without killing the
-    majority class.
+    classes, so the loss weight only needs a *mild* additional nudge.
+    Previous runs showed:
+      - 476:1 raw weights → model never predicted "good" (0% recall)
+      - 5:1 cap + sampler → model over-predicted defects (88% of good wrong)
+    Sampler removed: model now sees true distribution (~95% good). A 15:1 cap
+    ensures defect losses dominate enough to learn rare classes without
+    causing the model to over-predict them.
     """
     counts = Counter(labels)
     total  = len(labels)
@@ -199,18 +202,31 @@ def main():
     ap = argparse.ArgumentParser(description="Train defect classifier")
     ap.add_argument("--finetune", action="store_true",
                     help="Also run Phase 2 (unfreeze backbone). Recommended only with GPU.")
+    ap.add_argument("--phase2-only", action="store_true",
+                    help="Skip Phase 1, load existing checkpoint, run Phase 2 only.")
     ap.add_argument("--epochs", type=int, default=None,
-                    help="Override Phase 1 epochs (default: 15)")
+                    help="Override Phase 1 epochs (default: 20)")
+    ap.add_argument("--phase2-epochs", type=int, default=None,
+                    help="Override Phase 2 epochs (default: 20)")
     args = ap.parse_args()
 
     if args.epochs:
         global PHASE1_EP
         PHASE1_EP = args.epochs
+    if args.phase2_epochs:
+        global PHASE2_EP
+        PHASE2_EP = args.phase2_epochs
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Mode:   {'Phase 1 only (frozen backbone)' if not args.finetune else 'Phase 1 + Phase 2 (full fine-tune)'}")
+    if args.phase2_only:
+        mode_str = "Phase 2 only (load checkpoint, fine-tune backbone)"
+    elif args.finetune:
+        mode_str = "Phase 1 + Phase 2 (full fine-tune)"
+    else:
+        mode_str = "Phase 1 only (frozen backbone)"
+    print(f"Mode:   {mode_str}")
 
     # ── Load samples ────────────────────────────────────────────────────────
     ds_dir  = DATASET_DIR
@@ -240,7 +256,7 @@ def main():
 
     tr_loader = DataLoader(
         tr_ds, batch_size=BATCH_SIZE,
-        sampler=make_weighted_sampler(tr_l),
+        shuffle=True,
         num_workers=0, pin_memory=False,
     )
     va_loader = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
@@ -250,44 +266,54 @@ def main():
     cw    = class_weights_tensor(tr_l, NUM_CLASSES, device)
     criterion = nn.CrossEntropyLoss(weight=cw, label_smoothing=0.1)
 
-    best_bal_acc = 0.0
+    best_metric = 0.0
     history = {k: [] for k in ("tr_loss", "va_loss", "tr_acc", "va_acc", "va_bal")}
-
-    # ════════════════════════════════════════════════════════════════════════
-    # Phase 1 — frozen backbone, train head only  (fast)
-    # ════════════════════════════════════════════════════════════════════════
-    print(f"\n{'='*60}")
-    print(f" Phase 1: frozen backbone  ({PHASE1_EP} epochs)")
-    print(f"{'='*60}")
-    model.freeze_backbone()
-
     opt1 = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR_HEAD, weight_decay=1e-4,
     )
-    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=PHASE1_EP, eta_min=1e-6)
 
-    for ep in range(PHASE1_EP):
-        t0 = time.time()
-        tr_loss, tr_acc, _, _, _        = run_epoch(model, tr_loader, opt1, criterion, device, True)
-        va_loss, va_acc, va_bal, vp, vl = run_epoch(model, va_loader, opt1, criterion, device, False)
-        sched1.step()
+    if args.phase2_only:
+        # ── Load existing Phase 1 checkpoint, skip to Phase 2 ────────────
+        if not CHECKPOINT.exists():
+            print(f"ERROR: No checkpoint at {CHECKPOINT}. Run Phase 1 first.")
+            return
+        ckpt = torch.load(CHECKPOINT, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        best_metric = ckpt.get("val_acc", ckpt.get("val_bal_acc", 0.0))
+        print(f"Loaded checkpoint (epoch {ckpt.get('epoch','?')}, val_acc={best_metric:.4f})")
+    else:
+        # ════════════════════════════════════════════════════════════════════
+        # Phase 1 — frozen backbone, train head only  (fast)
+        # ════════════════════════════════════════════════════════════════════
+        print(f"\n{'='*60}")
+        print(f" Phase 1: frozen backbone  ({PHASE1_EP} epochs)")
+        print(f"{'='*60}")
+        model.freeze_backbone()
 
-        _log(history, tr_loss, va_loss, tr_acc, va_acc, va_bal)
-        print(f"  ep {ep+1:02d}/{PHASE1_EP}  loss {tr_loss:.4f}/{va_loss:.4f}  "
-              f"acc {tr_acc:.3f}/{va_acc:.3f}  bal_acc {va_bal:.3f}  "
-              f"({time.time()-t0:.1f}s)")
+        sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=PHASE1_EP, eta_min=1e-6)
+        for ep in range(PHASE1_EP):
+            t0 = time.time()
+            tr_loss, tr_acc, _, _, _        = run_epoch(model, tr_loader, opt1, criterion, device, True)
+            va_loss, va_acc, va_bal, vp, vl = run_epoch(model, va_loader, opt1, criterion, device, False)
+            sched1.step()
 
-        if va_bal > best_bal_acc:
-            best_bal_acc = va_bal
-            _save(model, ep, va_bal, CHECKPOINT, train_samples, device)
+            _log(history, tr_loss, va_loss, tr_acc, va_acc, va_bal)
+            print(f"  ep {ep+1:02d}/{PHASE1_EP}  loss {tr_loss:.4f}/{va_loss:.4f}  "
+                  f"acc {tr_acc:.3f}/{va_acc:.3f}  bal_acc {va_bal:.3f}  "
+                  f"({time.time()-t0:.1f}s)")
 
-    if not args.finetune:
-        print("\nSkipping Phase 2 (backbone remains frozen).")
-        print("Run with --finetune to unlock Phase 2 (recommended: GPU only).")
-        _finish(model, history, best_bal_acc, CHECKPOINT, train_samples, device,
-                va_loader, opt1, criterion, all_samples=samples)
-        return
+            if va_acc > best_metric:
+                best_metric = va_acc
+                _save(model, ep, va_acc, CHECKPOINT, train_samples, device)
+                print(f"    ✓ New best val-acc = {va_acc:.4f}")
+
+        if not args.finetune:
+            print("\nSkipping Phase 2 (backbone remains frozen).")
+            print("Run with --finetune to unlock Phase 2 (recommended: GPU only).")
+            _finish(model, history, best_metric, CHECKPOINT, train_samples, device,
+                    va_loader, opt1, criterion, all_samples=samples)
+            return
 
     # ════════════════════════════════════════════════════════════════════════
     # Phase 2 — unfreeze last 3 blocks, fine-tune
@@ -315,23 +341,23 @@ def main():
               f"acc {tr_acc:.3f}/{va_acc:.3f}  bal_acc {va_bal:.3f}  "
               f"({time.time()-t0:.1f}s)")
 
-        if va_bal > best_bal_acc:
-            best_bal_acc = va_bal
-            _save(model, PHASE1_EP + ep, va_bal, CHECKPOINT, train_samples, device)
-            print(f"    ✓ New best balanced-acc = {va_bal:.4f}")
+        if va_acc > best_metric:
+            best_metric = va_acc
+            _save(model, PHASE1_EP + ep, va_acc, CHECKPOINT, train_samples, device)
+            print(f"    ✓ New best val-acc = {va_acc:.4f}")
 
-    print(f"\nBest balanced accuracy: {best_bal_acc:.4f}")
-    _finish(model, history, best_bal_acc, CHECKPOINT, train_samples, device,
+    print(f"\nBest val accuracy: {best_metric:.4f}")
+    _finish(model, history, best_metric, CHECKPOINT, train_samples, device,
             va_loader, opt2, criterion, all_samples=samples)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _finish(model, history, best_bal_acc, checkpoint, train_samples, device,
+def _finish(model, history, best_metric, checkpoint, train_samples, device,
             va_loader, optimizer, criterion, all_samples):
     """Load best checkpoint, print report, save plots."""
-    print(f"\nBest balanced accuracy: {best_bal_acc:.4f}")
+    print(f"\nBest val accuracy: {best_metric:.4f}")
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
 
@@ -356,19 +382,21 @@ def _log(h, tl, vl, ta, va, vb):
     h["tr_acc"].append(ta);  h["va_acc"].append(va); h["va_bal"].append(vb)
 
 
-def _save(model, epoch, val_bal, path, train_samples, device):
+def _save(model, epoch, val_acc, path, train_samples, device):
     """Save model + prototypes computed from training data."""
     tr_ds     = DefectDataset(train_samples, get_transform(False))
     tr_loader = DataLoader(tr_ds, batch_size=32, shuffle=False, num_workers=0)
     protos    = compute_prototypes(model, tr_loader, device, NUM_CLASSES, EMBED_DIM)
 
+    counts = Counter(l for _, l in train_samples)
     torch.save({
-        "epoch":       epoch,
-        "model_state": model.state_dict(),
-        "val_bal_acc": val_bal,
-        "classes":     CLASSES,
-        "class2idx":   CLASS2IDX,
-        "prototypes":  protos.cpu(),
+        "epoch":        epoch,
+        "model_state":  model.state_dict(),
+        "val_acc":      val_acc,
+        "classes":      CLASSES,
+        "class2idx":    CLASS2IDX,
+        "prototypes":   protos.cpu(),
+        "class_counts": {cls: counts.get(CLASS2IDX[cls], 0) for cls in CLASSES},
     }, path)
 
 

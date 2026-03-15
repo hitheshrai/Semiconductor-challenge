@@ -90,6 +90,16 @@ class DefectClassificationApp:
         self.model.eval()
 
         self.prototypes = ckpt["prototypes"].to(self.device)  # (C, D)
+
+        # Prior correction: compensate for WeightedRandomSampler training bias
+        cc = ckpt.get("class_counts", {c: 1 for c in self.classes})
+        total = sum(cc.values()) or 1
+        prior = torch.tensor(
+            [cc.get(c, 1) / total for c in self.classes],
+            dtype=torch.float32, device=self.device,
+        )
+        self.log_prior = torch.log(prior)  # (C,)
+
         self._load_ms = (time.time() - t0) * 1000
         print(f"Model loaded in {self._load_ms:.0f} ms  |  device={self.device}")
         print(f"Known classes: {self.classes}")
@@ -123,8 +133,8 @@ class DefectClassificationApp:
         t0 = time.time()
         img   = Image.open(image_path).convert("RGB")
         embed = self._embed(img)                             # (1, D)
-        sim   = torch.mm(embed, self.prototypes.T)           # (1, C) cosine sims
-        probs = F.softmax(sim * 12, dim=1).squeeze(0)        # temperature=12
+        sim   = torch.mm(embed, self.prototypes.T)                        # (1, C) cosine sims
+        probs = F.softmax(sim * 12 + self.log_prior, dim=1).squeeze(0)   # prior-corrected
         pred_idx   = probs.argmax().item()
         pred_class = self.classes[pred_idx]
         confidence = probs[pred_idx].item()

@@ -30,7 +30,7 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report, confusion_matrix,
-    balanced_accuracy_score, roc_curve, auc,
+    balanced_accuracy_score, f1_score, roc_curve, auc,
     precision_recall_fscore_support,
 )
 import matplotlib
@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from model import DefectClassifier, compute_prototypes, EMBED_DIM
 
 # ─────────────────────────────────────────────────────────────────────────────
-DATASET_DIR = Path("C:/Users/hithe/Downloads/Dataset/Dataset")
+DATASET_DIR = Path(__file__).parent.parent / "Dataset"
 CHECKPOINT  = Path(__file__).parent / "output" / "model_best.pth"
 OUTPUT_DIR  = Path(__file__).parent / "output"
 IMG_SIZE    = 224
@@ -95,15 +95,26 @@ def load_model_and_data(checkpoint_path):
     )
     val_samples = list(zip(va_p, va_l))
 
-    return model, classes, class2idx, prototypes, device, val_samples, samples, history
+    # Compute true class prior from the full dataset for inference correction
+    total_counts = Counter(l for _, l in samples)
+    total = len(samples)
+    log_prior = torch.log(torch.tensor(
+        [total_counts.get(i, 1) / total for i in range(len(classes))],
+        dtype=torch.float32, device=device,
+    ))
+
+    return model, classes, class2idx, prototypes, device, val_samples, samples, history, log_prior
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Prediction helpers
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def predict_all(model, val_samples, prototypes, device, classes):
-    """Return (true_labels, pred_labels, probs_matrix)."""
+def predict_all(model, val_samples, prototypes, device, classes, log_prior):
+    """Return (true_labels, pred_labels, probs_matrix).
+    log_prior corrects for the sampling bias introduced by WeightedRandomSampler:
+    the model is trained on a balanced distribution but tested on the true prior.
+    """
     ds     = SimpleDataset(val_samples)
     loader = DataLoader(ds, batch_size=32, shuffle=False, num_workers=0)
 
@@ -112,7 +123,7 @@ def predict_all(model, val_samples, prototypes, device, classes):
         imgs = imgs.to(device)
         embeds = model.get_embedding(imgs)
         sim    = torch.mm(embeds, prototypes.T)
-        probs  = F.softmax(sim * 12, dim=1)
+        probs  = F.softmax(sim * 12 + log_prior, dim=1)
         preds  = probs.argmax(1)
         all_true.extend(labels.tolist())
         all_pred.extend(preds.cpu().tolist())
@@ -253,7 +264,7 @@ def plot_tsne(model, val_samples, classes, device, out, max_per_class=80):
 
     embeds = np.vstack(embeds_list)
     tsne   = TSNE(n_components=2, perplexity=min(30, len(embeds) // 5),
-                  random_state=SEED, n_iter=1000)
+                  random_state=SEED, max_iter=1000)
     coords = tsne.fit_transform(embeds)
 
     cmap   = plt.cm.get_cmap("tab10", len(classes))
@@ -350,12 +361,12 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Loading model and data …")
-    model, classes, class2idx, protos, device, val_samples, all_samples, history = \
+    model, classes, class2idx, protos, device, val_samples, all_samples, history, log_prior = \
         load_model_and_data(Path(args.checkpoint))
 
     print(f"Val set size: {len(val_samples)}")
     print("\nRunning predictions …")
-    true_l, pred_l, probs = predict_all(model, val_samples, protos, device, classes)
+    true_l, pred_l, probs = predict_all(model, val_samples, protos, device, classes, log_prior)
 
     # ── Console summary ───────────────────────────────────────────────────────
     print("\n── Classification Report ──────────────────────────────────────")

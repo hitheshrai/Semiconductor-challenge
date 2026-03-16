@@ -57,7 +57,7 @@ The real-world constraint is asymmetric cost: **a defective chip shipped as "goo
 
 ![Few-shot Learning Curve](solution/output/plot4_few_shot_learning_curve.png)
 
-The model achieves ~80% accuracy from a **single labelled example per defect class**.
+In few-shot mode (prototype inference from k examples, no retraining), the model achieves **~54% accuracy from a single labelled example per defect class**, rising to ~58% at 20-shot. Full-training prototype inference gives 91.25% avg defect recall.
 
 ---
 
@@ -177,7 +177,7 @@ python train_cascade.py --stage 2 --dinov2 --stage2-epochs 60
 python train_cascade.py --evaluate --dinov2
 
 # Full evaluation suite (6 plots + metrics.json)
-python evaluate.py
+python evaluate.py --cascade
 ```
 
 ---
@@ -219,7 +219,7 @@ Inference runs on any CUDA-capable GPU or CPU.
 
 1. **Two-stage cascade** — binary good/defect Stage 1 (Focal Loss, t=0.65) + defect-type Stage 2 (balanced + prototype inference). Resolves the fundamental objective conflict in single-model approaches.
 2. **DINOv2 ViT-Small/14 backbone** — self-supervised features pretrained on 142M images. Superior cosine-space clustering for prototype inference vs supervised ImageNet pretraining.
-3. **Test-time augmentation (TTA)** — 8 deterministic variants (4 rotations × 2 flips) averaged at Stage 1 and Stage 2, +2–4% defect recall at no training cost.
+3. **TTA-averaged prototypes** — each class prototype is computed as the mean embedding across 4 flip variants (identity + h-flip + v-flip + h+v-flip), giving a flip-invariant class centroid. Single-image inference against these prototypes outperforms TTA at inference (0.909 vs 0.880 balanced accuracy).
 4. **Post-hoc calibration** — tau-normalisation + logit adjustment to correct weight-norm bias from imbalanced training.
 5. **Few-shot extensibility** — new defect types registered at runtime via mean prototype, no retraining required.
 

@@ -155,7 +155,7 @@ For the single-model baseline, tau-normalisation (τ=0.3) and logit adjustment (
 | ViT + MAE pretraining cascade | 84.7% | 0.780 | 78.0% |
 | EfficientNet cascade + TTA | 87.4% | 0.867 | ~87% |
 | DINOv2 cascade (t=0.65) | 87.4% | 0.881 | 87.5% |
-| **DINOv2 + TTA-protos + no-TTA inference (60 ep)** | **87.7%** ✅ | **0.909** | **~85%** |
+| **DINOv2 + TTA-protos + no-TTA inference (60 ep)** | **87.7%** ✅ | **0.909** | **91.25%** |
 
 ### Final results: DINOv2 cascade (threshold=0.65)
 

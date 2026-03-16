@@ -73,7 +73,7 @@ Every approach was evaluated on the same validation split (20% stratified).
 | ViT + MAE pretraining cascade | 84.7% | 0.780 | 78.0% |
 | EfficientNet cascade + TTA | 87.4% | 0.867 | ~87% |
 | DINOv2 cascade (t=0.65) | 87.4% | 0.881 | 87.5% |
-| **DINOv2 + TTA-protos, no-TTA inference (60 ep)** | **87.7%** | **0.909** | **~85%** ✅ |
+| **DINOv2 + TTA-protos, no-TTA inference (60 ep)** | **87.7%** | **0.909** | **91.25%** ✅ |
 
 ### Training history (single model baseline)
 

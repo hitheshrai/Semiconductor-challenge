@@ -24,10 +24,12 @@ Cascade inference
 
 Usage
 ─────
-  python train_cascade.py --stage 1          # train Stage 1 only
-  python train_cascade.py --stage 2          # train Stage 2 only (requires Stage 1)
-  python train_cascade.py --stage both       # train Stage 1 then Stage 2
-  python train_cascade.py --evaluate         # evaluate full cascade on val set
+  python train_cascade.py --stage 1                      # train Stage 1 only
+  python train_cascade.py --stage 2                      # train Stage 2 only (requires Stage 1)
+  python train_cascade.py --stage 2 --augment-d8         # Stage 2 with 7× D4 defect8 augmentation
+  python train_cascade.py --stage both                   # train Stage 1 then Stage 2
+  python train_cascade.py --stage both --augment-d8      # full cascade + defect8 augmentation
+  python train_cascade.py --evaluate                     # evaluate full cascade on val set
 """
 
 import os, sys, time, random, json, pickle
@@ -38,7 +40,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, ConcatDataset
 from torchvision import transforms
 from PIL import Image
 from sklearn.model_selection import train_test_split
@@ -137,6 +139,46 @@ class SimpleDataset(Dataset):
         path, label = self.samples[idx]
         img = Image.open(path).convert("RGB")
         return self.transform(img), label
+
+
+class InMemoryDataset(Dataset):
+    """Dataset holding pre-generated tensors (for augmented samples)."""
+    def __init__(self, tensors, labels):
+        self.tensors = tensors
+        self.labels  = labels
+
+    def __len__(self): return len(self.tensors)
+
+    def __getitem__(self, idx): return self.tensors[idx], self.labels[idx]
+
+
+# D4 group: 7 non-identity symmetries (4 rotations × 2 flips, minus identity)
+_D4_OPS = [
+    lambda img: img.rotate(90),
+    lambda img: img.rotate(180),
+    lambda img: img.rotate(270),
+    lambda img: img.transpose(Image.FLIP_LEFT_RIGHT),
+    lambda img: img.transpose(Image.FLIP_LEFT_RIGHT).rotate(90),
+    lambda img: img.transpose(Image.FLIP_LEFT_RIGHT).rotate(180),
+    lambda img: img.transpose(Image.FLIP_LEFT_RIGHT).rotate(270),
+]
+
+_RESIZE_NORM = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(_MEAN, _STD),
+])
+
+
+def _augment_defect8(paths, label):
+    """Generate 7 D4-augmented copies of each path. Returns (tensors, labels)."""
+    tensors, labels = [], []
+    for p in paths:
+        img = Image.open(p).convert("RGB")
+        for op in _D4_OPS:
+            tensors.append(_RESIZE_NORM(op(img)))
+            labels.append(label)
+    return tensors, labels
 
 
 def load_samples_binary():
@@ -357,7 +399,7 @@ def _tune_threshold(device):
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 — Defect-type classifier
 # ─────────────────────────────────────────────────────────────────────────────
-def train_stage2(epochs: int = 40, device=None):
+def train_stage2(epochs: int = 40, device=None, augment_d8: bool = False):
     print(f"\n{'='*60}")
     print(f" Stage 2: Defect-type classifier  ({epochs} epochs)")
     print(f"{'='*60}")
@@ -375,8 +417,21 @@ def train_stage2(epochs: int = 40, device=None):
     tr_ds = SimpleDataset(list(zip(tr_p, tr_l)), get_transform(True))
     va_ds = SimpleDataset(list(zip(va_p, va_l)))
 
+    tr_l_sampler = list(tr_l)  # labels for balanced sampler (may be extended below)
+
+    if augment_d8:
+        d8_idx = DEFECT2IDX["defect8"]
+        d8_train_paths = [p for p, l in zip(tr_p, tr_l) if l == d8_idx]
+        aug_tensors, aug_labels = _augment_defect8(d8_train_paths, d8_idx)
+        aug_ds = InMemoryDataset(aug_tensors, aug_labels)
+        tr_ds  = ConcatDataset([tr_ds, aug_ds])
+        tr_l_sampler = tr_l_sampler + aug_labels
+        print(f"  defect8 augmented : {len(d8_train_paths)} train → "
+              f"+{len(aug_labels)} synthetic copies "
+              f"({len(d8_train_paths) + len(aug_labels)} total)")
+
     tr_loader = DataLoader(tr_ds, batch_size=min(BATCH_SIZE, 16),
-                           sampler=balanced_sampler(tr_l), num_workers=0)
+                           sampler=balanced_sampler(tr_l_sampler), num_workers=0)
     va_loader = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     model = _make_model(NUM_DEFECTS).to(device)
@@ -411,10 +466,46 @@ def train_stage2(epochs: int = 40, device=None):
     _report_stage2(device)
 
 
+def _compute_tta_prototypes(model, samples, device):
+    """Compute class prototypes using 4-flip TTA to match inference.
+
+    For each training image: embed 4 flip variants, average, re-normalise.
+    This ensures prototype and test embeddings live in the same averaged space.
+    """
+    _flips = [
+        transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                             transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)]),
+        transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                             transforms.RandomHorizontalFlip(p=1.0),
+                             transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)]),
+        transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                             transforms.RandomVerticalFlip(p=1.0),
+                             transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)]),
+        transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                             transforms.RandomHorizontalFlip(p=1.0),
+                             transforms.RandomVerticalFlip(p=1.0),
+                             transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)]),
+    ]
+    class_embeds = {i: [] for i in range(NUM_DEFECTS)}
+    model.eval()
+    with torch.no_grad():
+        for path, label in samples:
+            img = Image.open(path).convert("RGB")
+            aug_embs = []
+            for tf in _flips:
+                t = tf(img).unsqueeze(0).to(device)
+                aug_embs.append(F.normalize(model.get_embedding(t), dim=1))
+            e = F.normalize(torch.stack(aug_embs).mean(0), dim=1)
+            class_embeds[label].append(e)
+    protos = torch.zeros(NUM_DEFECTS, EMBED_DIM, device=device)
+    for c, embs in class_embeds.items():
+        if embs:
+            protos[c] = F.normalize(torch.stack(embs).mean(0).squeeze(0), dim=0)
+    return protos
+
+
 def _save_stage2(model, epoch, val_bal, train_samples, device):
-    tr_ds     = SimpleDataset(train_samples)
-    tr_loader = DataLoader(tr_ds, batch_size=32, shuffle=False, num_workers=0)
-    protos    = compute_prototypes(model, tr_loader, device, NUM_DEFECTS, EMBED_DIM)
+    protos = _compute_tta_prototypes(model, train_samples, device)
     counts    = Counter(l for _, l in train_samples)
     torch.save({
         "epoch":       epoch,
@@ -900,6 +991,10 @@ def main():
     ap.add_argument("--dinov2", action="store_true",
                     help="Use DINOv2 ViT-Small/14 pretrained backbone (timm). "
                          "Highest-quality features for prototype/cosine inference.")
+    ap.add_argument("--augment-d8", action="store_true",
+                    help="Add 7× D4 augmentations of defect8 train images to Stage 2 "
+                         "training set (rotations + flips). Targets Stage-2 defect8 "
+                         "confusion without affecting Stage 1 or other classes.")
     args = ap.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -931,7 +1026,8 @@ def main():
         train_stage1(epochs=args.stage1_epochs, device=device)
 
     if args.stage in ("2", "both"):
-        train_stage2(epochs=args.stage2_epochs, device=device)
+        train_stage2(epochs=args.stage2_epochs, device=device,
+                     augment_d8=args.augment_d8)
 
     if args.stage == "both":
         evaluate_cascade(device)

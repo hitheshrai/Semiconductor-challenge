@@ -79,18 +79,22 @@ class SimpleDataset(Dataset):
 
 
 def _make_tta_transforms():
-    """8 deterministic TTA variants: 4 rotations × 2 flips (matches classify.py)."""
-    variants = []
-    for angle in [0, 90, 180, 270]:
-        for flip in [False, True]:
-            ops = [transforms.Resize((IMG_SIZE, IMG_SIZE))]
-            if angle:
-                ops.append(transforms.Lambda(lambda img, a=angle: img.rotate(a)))
-            if flip:
-                ops.append(transforms.RandomHorizontalFlip(p=1.0))
-            ops.extend([transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)])
-            variants.append(transforms.Compose(ops))
-    return variants
+    """4 deterministic TTA variants: identity + h-flip + v-flip + h+v-flip.
+
+    Flip-only TTA matches the training augmentation (RandomHorizontalFlip +
+    RandomVerticalFlip). Full 90° rotation TTA is out-of-distribution for
+    Stage 2 (trained with RandomRotation(30) only) and degrades embeddings.
+    """
+    base = [transforms.Resize((IMG_SIZE, IMG_SIZE))]
+    norm = [transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)]
+    hf = transforms.RandomHorizontalFlip(p=1.0)
+    vf = transforms.RandomVerticalFlip(p=1.0)
+    return [
+        transforms.Compose(base + norm),                   # identity
+        transforms.Compose(base + [hf] + norm),            # h-flip
+        transforms.Compose(base + [vf] + norm),            # v-flip
+        transforms.Compose(base + [hf, vf] + norm),        # h+v-flip
+    ]
 
 
 def _auto_load_model(num_classes, state_dict, device):

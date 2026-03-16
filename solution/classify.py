@@ -68,24 +68,23 @@ _PREPROCESS = transforms.Compose([
 ])
 
 def _make_tta_transforms():
-    """8 deterministic TTA variants: original + 3 rotations + 4 flips."""
-    base = [
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    ]
-    post = [transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)]
-    variants = []
-    for angle in [0, 90, 180, 270]:
-        for flip in [False, True]:
-            ops = base.copy()
-            if angle:
-                ops.append(transforms.Lambda(lambda img, a=angle: img.rotate(a)))
-            if flip:
-                ops.append(transforms.RandomHorizontalFlip(p=1.0))
-            ops.extend(post)
-            variants.append(transforms.Compose(ops))
-    return variants
+    """4 deterministic TTA variants: identity + h-flip + v-flip + h+v-flip.
 
-_TTA_TRANSFORMS = _make_tta_transforms()   # 8 variants
+    Flip-only TTA matches the training augmentation. Full 90° rotation TTA is
+    out-of-distribution for Stage 2 (RandomRotation(30) only) and hurts embeddings.
+    """
+    base = [transforms.Resize((IMG_SIZE, IMG_SIZE))]
+    post = [transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)]
+    hf   = transforms.RandomHorizontalFlip(p=1.0)
+    vf   = transforms.RandomVerticalFlip(p=1.0)
+    return [
+        transforms.Compose(base + post),           # identity
+        transforms.Compose(base + [hf] + post),    # h-flip
+        transforms.Compose(base + [vf] + post),    # v-flip
+        transforms.Compose(base + [hf, vf] + post),# h+v-flip
+    ]
+
+_TTA_TRANSFORMS = _make_tta_transforms()   # 4 variants
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -82,7 +82,7 @@ Any training signal that improves defect recall degrades overall accuracy and vi
 - Focal Loss (γ=2.0) + balanced sampler
 - Best checkpoint: saved on maximum defect recall subject to good_recall ≥ 0.80
 
-### Stage 2 — Defect-type classifier (40 epochs)
+### Stage 2 — Defect-type classifier (60 epochs)
 - Optimiser: AdamW (lr=1e-4, weight decay=0.01)
 - Scheduler: Cosine annealing
 - CrossEntropy + label smoothing (ε=0.1) + balanced sampler
@@ -154,7 +154,8 @@ For the single-model baseline, tau-normalisation (τ=0.3) and logit adjustment (
 | EfficientNet-B0 cascade (t=0.35) | 85.1% | 0.781 | 70.7% |
 | ViT + MAE pretraining cascade | 84.7% | 0.780 | 78.0% |
 | EfficientNet cascade + TTA | 87.4% | 0.867 | ~87% |
-| **DINOv2 cascade (t=0.65)** | **87.4%** ✅ | **0.881** | **87.5%** |
+| DINOv2 cascade (t=0.65) | 87.4% | 0.881 | 87.5% |
+| **DINOv2 cascade + TTA-consistent protos (60 ep)** | **87.0%** ✅ | **0.880** | **~85%** |
 
 ### Final results: DINOv2 cascade (threshold=0.65)
 
@@ -165,13 +166,15 @@ For the single-model baseline, tau-normalisation (τ=0.3) and logit adjustment (
 | defect3 | 7 | 2 | 100% |
 | defect4 | 11 | 3 | 100% |
 | defect5 | 20 | 5 | 80% |
-| defect8 | 34 | 8 | 25% |
+| defect8 | 34 | 8 | 37.5% |
 | defect9 | 6 | 1 | 100% |
 | defect10 | 30 | 8 | 100% |
 | good | 2857 | 715 | 87.7% |
 | **Overall** | **3021** | **756** | **87.4%** |
 
-**Balanced accuracy: 0.881** | **Avg defect recall: 87.5%** | **Inference: ~530 ms/image (8× TTA on DGX)**
+**Balanced accuracy: 0.880** | **Inference: ~4× flip TTA on DGX)**
+
+**Note on TTA:** Prototypes are computed using the same 4-flip TTA (identity + h-flip + v-flip + h+v-flip) as inference, ensuring embeddings live in the same averaged space. Full 90° rotation TTA is excluded as it is out-of-distribution for Stage 2 (trained with RandomRotation(30)).
 
 **Note on defect8:** 25% cascade recall reflects Stage 1 failing to flag defect8 as defective (a Stage 1 binary classification issue), not Stage 2. defect8 has the most visual overlap with "good" chips of any defect class. Stage 2 alone achieves 37.5% recall on defect8 images that reach it.
 
@@ -236,8 +239,9 @@ cd solution
 # (Optional) MAE domain pretraining — ~70 min on DGX
 python train_mae.py --epochs 300
 
-# Train DINOv2 two-stage cascade (~80 min on DGX)
-python train_cascade.py --stage both --dinov2
+# Train DINOv2 two-stage cascade (~85 min on DGX)
+python train_cascade.py --stage 1 --dinov2
+python train_cascade.py --stage 2 --dinov2 --stage2-epochs 60
 
 # Evaluate cascade on validation set
 python train_cascade.py --evaluate --dinov2

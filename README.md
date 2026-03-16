@@ -29,13 +29,13 @@ The real-world constraint is asymmetric cost: **a defective chip shipped as "goo
 | defect3 | 2 | 100% |
 | defect4 | 3 | 100% |
 | defect5 | 5 | 80% |
-| defect8 | 8 | 25% |
+| defect8 | 8 | 37.5% |
 | defect9 | 1 | 100% |
-| defect10 | 8 | 100% |
-| good | 715 | 87.7% |
-| **Overall** | **756** | **87.4%** ✅ |
+| defect10 | 8 | 87.5% |
+| good | 715 | 87.3% |
+| **Overall** | **756** | **87.0%** ✅ |
 
-**Balanced accuracy: 0.881** | **Avg defect recall: 87.5%** | **Inference: ~530 ms/image (8× TTA)**
+**Balanced accuracy: 0.880** | **Inference: 4× flip TTA (identity + h-flip + v-flip + h+v-flip)**
 
 ### Cascade confusion matrix
 
@@ -72,7 +72,8 @@ Every approach was evaluated on the same validation split (20% stratified).
 | EfficientNet cascade (t=0.35) | 85.1% | 0.781 | 70.7% |
 | ViT + MAE pretraining cascade | 84.7% | 0.780 | 78.0% |
 | EfficientNet cascade + TTA | 87.4% | 0.867 | ~87% |
-| **DINOv2 cascade (t=0.65)** | **87.4%** | **0.881** | **87.5%** ✅ |
+| DINOv2 cascade (t=0.65) | 87.4% | 0.881 | 87.5% |
+| **DINOv2 + TTA-consistent protos (60 ep)** | **87.0%** | **0.880** | **~85%** ✅ |
 
 ### Training history (single model baseline)
 
@@ -169,7 +170,8 @@ cd solution
 python train_mae.py --epochs 300
 
 # Train DINOv2 two-stage cascade (~80 min on DGX)
-python train_cascade.py --stage both --dinov2
+python train_cascade.py --stage 1 --dinov2
+python train_cascade.py --stage 2 --dinov2 --stage2-epochs 60
 
 # Evaluate cascade on validation set
 python train_cascade.py --evaluate --dinov2

@@ -29,13 +29,13 @@ The real-world constraint is asymmetric cost: **a defective chip shipped as "goo
 | defect3 | 2 | 100% |
 | defect4 | 3 | 100% |
 | defect5 | 5 | 80% |
-| defect8 | 8 | 37.5% |
+| defect8 | 8 | 50% |
 | defect9 | 1 | 100% |
-| defect10 | 8 | 87.5% |
-| good | 715 | 87.3% |
-| **Overall** | **756** | **87.0%** ✅ |
+| defect10 | 8 | 100% |
+| good | 715 | 87.7% |
+| **Overall** | **756** | **87.7%** ✅ |
 
-**Balanced accuracy: 0.880** | **Inference: ~46 ms/image (4× flip TTA, DGX GB10, warm GPU)**
+**Balanced accuracy: 0.909** | **Inference: ~46 ms/image (single-image, DGX GB10, warm GPU)**
 
 ### Cascade confusion matrix
 
@@ -73,7 +73,7 @@ Every approach was evaluated on the same validation split (20% stratified).
 | ViT + MAE pretraining cascade | 84.7% | 0.780 | 78.0% |
 | EfficientNet cascade + TTA | 87.4% | 0.867 | ~87% |
 | DINOv2 cascade (t=0.65) | 87.4% | 0.881 | 87.5% |
-| **DINOv2 + TTA-consistent protos (60 ep)** | **87.0%** | **0.880** | **~85%** ✅ |
+| **DINOv2 + TTA-protos, no-TTA inference (60 ep)** | **87.7%** | **0.909** | **~85%** ✅ |
 
 ### Training history (single model baseline)
 

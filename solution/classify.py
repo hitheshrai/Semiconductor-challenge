@@ -95,10 +95,10 @@ class DefectClassificationApp:
       • Single-image prediction
       • Batch prediction
       • Runtime registration of new defect classes (few-shot)
-      • Test-time augmentation (TTA) for improved accuracy
+      • Single-image inference (TTA-averaged prototypes already encode flip invariance)
     """
 
-    def __init__(self, checkpoint_path: Path = CHECKPOINT, tta: bool = True):
+    def __init__(self, checkpoint_path: Path = CHECKPOINT, tta: bool = False):
         t0 = time.time()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tta    = tta
@@ -481,7 +481,7 @@ def main():
                     help="Register a new class: --register <class_name> img1.png img2.png …")
     ap.add_argument("--eval",     action="store_true",
                     help="Evaluate: path must be folder with sub-folders named by class")
-    ap.add_argument("--no-tta",   action="store_true", help="Disable test-time augmentation")
+    ap.add_argument("--tta",      action="store_true", help="Enable 4× flip TTA (default: off)")
     ap.add_argument("--cascade",  action="store_true",
                     help="Use two-stage cascade (model_stage1.pth + model_stage2.pth). "
                          "Best defect recall. Requires train_cascade.py to have been run.")
@@ -490,7 +490,7 @@ def main():
     if args.cascade:
         app = CascadeClassificationApp(CHECKPOINT_S1, CHECKPOINT_S2)
     else:
-        app  = DefectClassificationApp(Path(args.checkpoint), tta=not args.no_tta)
+        app  = DefectClassificationApp(Path(args.checkpoint), tta=args.tta)
     path = Path(args.path)
 
     # Optional: register new class first

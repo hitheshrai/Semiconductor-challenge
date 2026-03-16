@@ -15,8 +15,8 @@ Usage
 ─────
   python evaluate.py                             # single EfficientNet model
   python evaluate.py --checkpoint output/model_best.pth
-  python evaluate.py --cascade                   # DINOv2 two-stage cascade (best)
-  python evaluate.py --cascade --no-tta          # cascade without TTA (faster)
+  python evaluate.py --cascade                   # DINOv2 two-stage cascade (best, no TTA)
+  python evaluate.py --cascade --tta             # cascade with 4× flip TTA
 """
 
 import sys, random, json
@@ -448,7 +448,7 @@ def plot_tsne(model, val_samples, classes, device, out, max_per_class=80, title_
                   random_state=SEED, max_iter=1000)
     coords = tsne.fit_transform(embeds)
 
-    cmap   = plt.cm.get_cmap("tab10", len(classes))
+    cmap   = plt.colormaps["tab10"].resampled(len(classes))
     fig, ax = plt.subplots(figsize=(9, 7))
     for i, cls in enumerate(classes):
         mask = np.array(lbls) == i
@@ -540,8 +540,10 @@ def main():
                     help="Single-model checkpoint (ignored when --cascade is set)")
     ap.add_argument("--cascade", action="store_true",
                     help="Use two-stage cascade (model_stage1.pth + model_stage2.pth)")
-    ap.add_argument("--no-tta", action="store_true",
-                    help="Disable test-time augmentation for cascade mode (faster)")
+    ap.add_argument("--tta", action="store_true",
+                    help="Enable 4× flip TTA at inference (default: off — "
+                         "TTA-averaged prototypes already encode flip invariance; "
+                         "single-image inference gives higher balanced accuracy)")
     args = ap.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -552,7 +554,7 @@ def main():
         model1, model2, threshold, prototypes, rescue_tau, rescue_floor, rescue_idx, \
             device, val_samples, all_samples = load_cascade_and_data()
 
-        use_tta = not args.no_tta
+        use_tta = args.tta
         print(f"\nRunning cascade predictions (TTA={'4× flip' if use_tta else 'off'}) …")
         true_l, pred_l, probs = predict_all_cascade(
             model1, model2, threshold, prototypes, rescue_tau, rescue_floor,

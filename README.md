@@ -35,7 +35,7 @@ The real-world constraint is asymmetric cost: **a defective chip shipped as "goo
 | good | 715 | 87.3% |
 | **Overall** | **756** | **87.0%** ✅ |
 
-**Balanced accuracy: 0.880** | **Inference: 4× flip TTA (identity + h-flip + v-flip + h+v-flip)**
+**Balanced accuracy: 0.880** | **Inference: ~46 ms/image (4× flip TTA, DGX GB10, warm GPU)**
 
 ### Cascade confusion matrix
 

@@ -4,7 +4,7 @@ evaluate.py  –  Full evaluation suite
                 ASU / Intel Semiconductor Solutions Challenge 2026
 
 Produces all competition deliverable plots:
-  plot1_training_history.png          (training curves)
+  plot1_training_history.png          (training curves — single model only)
   plot2_confusion_matrix.png          (normalised confusion matrix)
   plot3_class_accuracy_vs_occurrence.png (deliverable 2)
   plot4_few_shot_learning_curve.png   (deliverable 4)
@@ -13,8 +13,10 @@ Produces all competition deliverable plots:
 
 Usage
 ─────
-  python evaluate.py                         # uses default checkpoint + dataset
+  python evaluate.py                             # single EfficientNet model
   python evaluate.py --checkpoint output/model_best.pth
+  python evaluate.py --cascade                   # DINOv2 two-stage cascade (best)
+  python evaluate.py --cascade --no-tta          # cascade without TTA (faster)
 """
 
 import sys, random, json
@@ -42,13 +44,22 @@ sys.path.insert(0, str(Path(__file__).parent))
 from model import DefectClassifier, compute_prototypes, EMBED_DIM
 
 # ─────────────────────────────────────────────────────────────────────────────
-DATASET_DIR = Path(__file__).parent.parent / "Dataset"
-CHECKPOINT  = Path(__file__).parent / "output" / "model_best.pth"
-OUTPUT_DIR  = Path(__file__).parent / "output"
-IMG_SIZE    = 224
-SEED        = 42
+DATASET_DIR  = Path(__file__).parent.parent / "Dataset"
+CHECKPOINT   = Path(__file__).parent / "output" / "model_best.pth"
+CKPT_STAGE1  = Path(__file__).parent / "output" / "model_stage1.pth"
+CKPT_STAGE2  = Path(__file__).parent / "output" / "model_stage2.pth"
+OUTPUT_DIR   = Path(__file__).parent / "output"
+IMG_SIZE     = 224
+SEED         = 42
 _MEAN = [0.485, 0.456, 0.406]
 _STD  = [0.229, 0.224, 0.225]
+
+# Class ordering used by the cascade (matches train_cascade.py)
+_CASCADE_CLASSES  = ["defect1", "defect2", "defect3", "defect4", "defect5",
+                     "defect8", "defect9", "defect10", "good"]
+_DEFECT_CLASSES   = [c for c in _CASCADE_CLASSES if c != "good"]
+_GOOD_IDX_ALL     = _CASCADE_CLASSES.index("good")   # 8
+_DEFECT_IDX_BIN   = 1                                  # Stage 1: good=0, defective=1
 
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
@@ -65,6 +76,137 @@ class SimpleDataset(Dataset):
     def __getitem__(self, i):
         p, l = self.samples[i]
         return self.tf(Image.open(p).convert("RGB")), l
+
+
+def _make_tta_transforms():
+    """8 deterministic TTA variants: 4 rotations × 2 flips (matches classify.py)."""
+    variants = []
+    for angle in [0, 90, 180, 270]:
+        for flip in [False, True]:
+            ops = [transforms.Resize((IMG_SIZE, IMG_SIZE))]
+            if angle:
+                ops.append(transforms.Lambda(lambda img, a=angle: img.rotate(a)))
+            if flip:
+                ops.append(transforms.RandomHorizontalFlip(p=1.0))
+            ops.extend([transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)])
+            variants.append(transforms.Compose(ops))
+    return variants
+
+
+def _auto_load_model(num_classes, state_dict, device):
+    """Detect backbone from checkpoint key names and load the correct model class."""
+    keys = "".join(state_dict.keys())
+    if "backbone.cls_token" in keys:
+        if "backbone.blocks.0.ls1" in keys:
+            from model_dinov2 import DINOv2DefectClassifier
+            m = DINOv2DefectClassifier(num_classes, EMBED_DIM).to(device)
+        else:
+            from model_vit import ViTDefectClassifier
+            m = ViTDefectClassifier(num_classes, EMBED_DIM, mae_ckpt=None).to(device)
+    else:
+        m = DefectClassifier(num_classes, EMBED_DIM).to(device)
+    m.load_state_dict(state_dict)
+    m.eval()
+    return m
+
+
+def load_cascade_and_data(stage1_path=CKPT_STAGE1, stage2_path=CKPT_STAGE2):
+    """Load Stage 1 + Stage 2 cascade models and reproduce the training val split."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt1 = torch.load(stage1_path, map_location=device, weights_only=False)
+    model1 = _auto_load_model(2, ckpt1["model_state"], device)
+    threshold = ckpt1.get("threshold", 0.65)
+
+    ckpt2 = torch.load(stage2_path, map_location=device, weights_only=False)
+    model2 = _auto_load_model(len(_DEFECT_CLASSES), ckpt2["model_state"], device)
+    prototypes = ckpt2["prototypes"].to(device)
+
+    # Rebuild dataset with ALL_CLASSES ordering from train_cascade.py
+    all_samples = []
+    for cls in _CASCADE_CLASSES:
+        d = DATASET_DIR / cls
+        if not d.exists():
+            continue
+        lbl = _CASCADE_CLASSES.index(cls)
+        for f in d.iterdir():
+            if f.suffix.upper() in {".PNG", ".JPG", ".JPEG"}:
+                all_samples.append((str(f), lbl))
+
+    paths, labels = zip(*all_samples)
+    _, va_p, _, va_l = train_test_split(
+        paths, labels, test_size=0.2, stratify=labels, random_state=SEED
+    )
+    val_samples = list(zip(va_p, va_l))
+
+    print(f"Device: {device}  |  Stage 1 threshold: {threshold:.2f}")
+    print(f"All samples: {len(all_samples)}  |  Val set: {len(val_samples)}")
+    return model1, model2, threshold, prototypes, device, val_samples, all_samples
+
+
+@torch.no_grad()
+def predict_all_cascade(model1, model2, threshold, prototypes, val_samples, device, use_tta=True):
+    """Two-stage cascade prediction.  Returns (true_l, pred_l, probs [N x 9])."""
+    tta_transforms = _make_tta_transforms() if use_tta else None
+    val_tf = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(_MEAN, _STD),
+    ])
+    n_classes = len(_CASCADE_CLASSES)
+    all_true, all_pred, all_probs = [], [], []
+
+    for img_path, true_lbl in val_samples:
+        img_pil = Image.open(img_path).convert("RGB")
+
+        # Stage 1 — TTA-averaged defect probability
+        if use_tta:
+            dp_list = []
+            for tf in tta_transforms:
+                img_t = tf(img_pil).unsqueeze(0).to(device)
+                logits1, _ = model1(img_t)
+                dp_list.append(F.softmax(logits1, dim=1)[0, _DEFECT_IDX_BIN].item())
+            defect_prob = float(np.mean(dp_list))
+        else:
+            img_t = val_tf(img_pil).unsqueeze(0).to(device)
+            logits1, _ = model1(img_t)
+            defect_prob = F.softmax(logits1, dim=1)[0, _DEFECT_IDX_BIN].item()
+
+        # Build full probability vector (for ROC curves)
+        probs = np.zeros(n_classes)
+
+        if defect_prob < threshold:
+            pred = _GOOD_IDX_ALL
+            probs[_GOOD_IDX_ALL] = 1.0 - defect_prob
+            for j in range(n_classes):
+                if j != _GOOD_IDX_ALL:
+                    probs[j] = defect_prob / len(_DEFECT_CLASSES)
+        else:
+            # Stage 2 — TTA-averaged embedding → cosine similarity → prototype
+            if use_tta:
+                emb_list = []
+                for tf in tta_transforms:
+                    img_t = tf(img_pil).unsqueeze(0).to(device)
+                    emb_list.append(model2.get_embedding(img_t))
+                embed2 = F.normalize(torch.stack(emb_list).mean(0), dim=1)
+            else:
+                img_t = val_tf(img_pil).unsqueeze(0).to(device)
+                embed2 = model2.get_embedding(img_t)
+
+            sims = torch.mm(embed2, prototypes.T).squeeze(0)   # (8,)
+            stage2_probs = F.softmax(sims * 10, dim=0).cpu().numpy()
+            defect_pred_idx = int(sims.argmax().item())
+            pred = _CASCADE_CLASSES.index(_DEFECT_CLASSES[defect_pred_idx])
+
+            probs[_GOOD_IDX_ALL] = 1.0 - defect_prob
+            for i, dc in enumerate(_DEFECT_CLASSES):
+                probs[_CASCADE_CLASSES.index(dc)] = defect_prob * float(stage2_probs[i])
+
+        all_true.append(true_lbl)
+        all_pred.append(pred)
+        all_probs.append(probs)
+
+    return np.array(all_true), np.array(all_pred), np.vstack(all_probs)
 
 
 def tau_normalize(model, tau: float = 0.5):
@@ -250,7 +392,7 @@ def plot_roc_curves(true_l, probs, classes, out):
     plt.savefig(p, dpi=150); plt.close(); print(f"Saved: {p}")
 
 
-def plot_tsne(model, val_samples, classes, device, out, max_per_class=80):
+def plot_tsne(model, val_samples, classes, device, out, max_per_class=80, title_suffix=""):
     """t-SNE of learned embeddings — shows how well classes are separated."""
     try:
         from sklearn.manifold import TSNE
@@ -291,7 +433,7 @@ def plot_tsne(model, val_samples, classes, device, out, max_per_class=80):
         if mask.any():
             ax.scatter(coords[mask, 0], coords[mask, 1],
                        color=cmap(i), label=cls, s=25, alpha=0.75, edgecolors="none")
-    ax.set(title="t-SNE of Learned Embeddings (EfficientNet-B0 + Head)",
+    ax.set(title=f"t-SNE of Learned Embeddings{title_suffix}",
            xlabel="t-SNE dim 1", ylabel="t-SNE dim 2")
     ax.legend(markerscale=2, fontsize=9); ax.grid(alpha=.2)
     plt.tight_layout()
@@ -372,30 +514,60 @@ def plot_few_shot_learning_curve(model, all_samples, classes, class2idx, device,
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=str(CHECKPOINT))
+    ap.add_argument("--checkpoint", default=str(CHECKPOINT),
+                    help="Single-model checkpoint (ignored when --cascade is set)")
+    ap.add_argument("--cascade", action="store_true",
+                    help="Use two-stage cascade (model_stage1.pth + model_stage2.pth)")
+    ap.add_argument("--no-tta", action="store_true",
+                    help="Disable test-time augmentation for cascade mode (faster)")
     args = ap.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Loading model and data …")
-    model, classes, class2idx, protos, device, val_samples, all_samples, history, log_prior = \
-        load_model_and_data(Path(args.checkpoint))
+    if args.cascade:
+        # ── Cascade path (DINOv2 two-stage) ─────────────────────────────────
+        print("Loading DINOv2 two-stage cascade …")
+        model1, model2, threshold, prototypes, device, val_samples, all_samples = \
+            load_cascade_and_data()
 
-    print(f"Val set size: {len(val_samples)}")
-    print("\nRunning predictions …")
-    true_l, pred_l, probs = predict_all(model, val_samples, protos, device, classes, log_prior)
+        use_tta = not args.no_tta
+        print(f"\nRunning cascade predictions (TTA={'8×' if use_tta else 'off'}) …")
+        print("  (this may take several minutes with TTA on CPU)")
+        true_l, pred_l, probs = predict_all_cascade(
+            model1, model2, threshold, prototypes, val_samples, device, use_tta=use_tta
+        )
+        classes = _CASCADE_CLASSES
+        class2idx = {c: i for i, c in enumerate(classes)}
+        history = {}   # no combined history for cascade
+        # t-SNE and few-shot use model1 (trained on all classes incl. "good")
+        tsne_model = model1
+        tsne_title_suffix = " (DINOv2 ViT-Small/14 — Stage 1)"
+
+    else:
+        # ── Single-model path (EfficientNet baseline) ────────────────────────
+        print("Loading model and data …")
+        model, classes, class2idx, protos, device, val_samples, all_samples, history, log_prior = \
+            load_model_and_data(Path(args.checkpoint))
+        print(f"Val set size: {len(val_samples)}")
+        print("\nRunning predictions …")
+        true_l, pred_l, probs = predict_all(model, val_samples, protos, device, classes, log_prior)
+        tsne_model = model
+        tsne_title_suffix = " (EfficientNet-B0 + Head)"
 
     # ── Console summary ───────────────────────────────────────────────────────
     print("\n── Classification Report ──────────────────────────────────────")
     print(classification_report(true_l, pred_l, target_names=classes, digits=3))
     ba = balanced_accuracy_score(true_l, pred_l)
     f1 = f1_score(true_l, pred_l, average="macro")
+    overall_acc = (true_l == pred_l).mean()
+    print(f"  Overall accuracy  : {overall_acc:.4f}")
     print(f"  Balanced accuracy : {ba:.4f}")
     print(f"  Macro F1          : {f1:.4f}")
 
     # ── Save metrics JSON ────────────────────────────────────────────────────
     p_rec_f1_sup = precision_recall_fscore_support(true_l, pred_l, labels=list(range(len(classes))))
     metrics = {
+        "overall_accuracy":  round(float(overall_acc), 4),
         "balanced_accuracy": round(ba, 4),
         "macro_f1":          round(f1, 4),
         "per_class": {
@@ -420,9 +592,10 @@ def main():
     plot_class_accuracy_vs_occurrence(true_l, pred_l, classes, all_samples, OUTPUT_DIR)
     plot_roc_curves(true_l, probs, classes, OUTPUT_DIR)
     print("\nGenerating t-SNE (may take 1–2 min on CPU) …")
-    plot_tsne(model, val_samples, classes, device, OUTPUT_DIR)
+    plot_tsne(tsne_model, val_samples, classes, device, OUTPUT_DIR,
+              title_suffix=tsne_title_suffix)
     print("\nGenerating few-shot learning curve …")
-    plot_few_shot_learning_curve(model, all_samples, classes, class2idx, device, OUTPUT_DIR)
+    plot_few_shot_learning_curve(tsne_model, all_samples, classes, class2idx, device, OUTPUT_DIR)
 
     print(f"\nAll evaluation outputs saved to {OUTPUT_DIR.resolve()}")
 

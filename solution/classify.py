@@ -21,7 +21,7 @@ Usage
   python classify.py path/to/test_root/ --eval [--cascade]
 """
 
-import sys, time, json, argparse
+import sys, time, json, argparse, pickle
 from pathlib import Path
 from collections import defaultdict
 
@@ -312,10 +312,12 @@ class CascadeClassificationApp:
         self.model2 = _load_model(len(self.defect_classes), ckpt2["model_state"], self.device)
         self.protos2 = ckpt2["prototypes"].to(self.device)  # (8, D)
 
-        # defect8 rescue path (tuned via --tune-rescue)
+        # defect8 rescue paths (prototype or OC-SVM, loaded if tuned)
         self.rescue_tau   = ckpt2.get("defect8_rescue_threshold", None)
         self.rescue_floor = ckpt2.get("defect8_rescue_floor",     0.0)
         self.rescue_idx   = ckpt2.get("defect8_rescue_idx",       None)
+        ocsvm_blob = ckpt2.get("defect8_ocsvm", None)
+        self.ocsvm_rescue = pickle.loads(ocsvm_blob) if ocsvm_blob is not None else None
 
         # Full class list for output consistency
         self.classes   = self.defect_classes + ["good"]
@@ -324,7 +326,10 @@ class CascadeClassificationApp:
         self._load_ms = (time.time() - t0) * 1000
         print(f"Cascade loaded in {self._load_ms:.0f} ms  |  device={self.device}")
         print(f"Stage 1 threshold: {self.threshold:.2f}")
-        if self.rescue_tau is not None:
+        if self.ocsvm_rescue is not None:
+            r = self.ocsvm_rescue
+            print(f"defect8 OC-SVM   : nu={r['ocsvm'].nu:.2f}, floor={r['floor']:.2f}, dt={r.get('dt',0):.3f}")
+        elif self.rescue_tau is not None:
             print(f"defect8 rescue   : floor={self.rescue_floor:.2f}, τ={self.rescue_tau:.2f}")
         print(f"Defect classes: {self.defect_classes}")
 
@@ -344,9 +349,26 @@ class CascadeClassificationApp:
         defect_prob = float(np.mean(defect_probs))
 
         if defect_prob < self.threshold:
-            # defect8 rescue: compound condition — suspicion floor + proto similarity
             rescue_fired = False
-            if self.rescue_tau is not None and defect_prob >= self.rescue_floor:
+            # OC-SVM rescue (preferred if available)
+            if self.ocsvm_rescue is not None and defect_prob >= self.ocsvm_rescue["floor"]:
+                embeds2_rescue = [self.model2.get_embedding(t) for t in tensors]
+                embed2_rescue  = F.normalize(torch.stack(embeds2_rescue).mean(0), dim=1)
+                e_np     = embed2_rescue.squeeze(0).cpu().numpy().reshape(1, -1)
+                e_scaled = self.ocsvm_rescue["scaler"].transform(e_np)
+                dt       = self.ocsvm_rescue.get("dt", 0.0)
+                if self.ocsvm_rescue["ocsvm"].decision_function(e_scaled)[0] > dt:
+                    d8_idx     = self.ocsvm_rescue["d8_idx"]
+                    pred_class = self.defect_classes[d8_idx]
+                    confidence = float(self.ocsvm_rescue["ocsvm"].decision_function(e_scaled)[0])
+                    scores     = {c: round(
+                                      torch.mm(embed2_rescue,
+                                               self.protos2[i].unsqueeze(1)).item(), 4)
+                                  for i, c in enumerate(self.defect_classes)}
+                    scores["good"] = round(1.0 - defect_prob, 4)
+                    rescue_fired = True
+            # Prototype cosine rescue (fallback)
+            elif self.rescue_tau is not None and defect_prob >= self.rescue_floor:
                 embeds2_rescue = [self.model2.get_embedding(t) for t in tensors]
                 embed2_rescue  = F.normalize(torch.stack(embeds2_rescue).mean(0), dim=1)
                 d8_sim = torch.mm(embed2_rescue,

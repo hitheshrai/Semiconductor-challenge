@@ -34,6 +34,25 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from model import DefectClassifier, EMBED_DIM
 
+
+def _load_model(num_classes: int, state_dict: dict, device):
+    """Auto-detect backbone from checkpoint keys and return loaded model."""
+    keys = list(state_dict.keys())
+    if any("backbone.cls_token" in k for k in keys):
+        # DINOv2 or MAE ViT backbone
+        if any("backbone.patch_embed.proj" in k and "backbone.blocks.0.ls1" in "".join(keys) for k in keys):
+            from model_dinov2 import DINOv2DefectClassifier
+            m = DINOv2DefectClassifier(num_classes, EMBED_DIM).to(device)
+        else:
+            from model_vit import ViTDefectClassifier
+            from pathlib import Path as _Path
+            m = ViTDefectClassifier(num_classes, EMBED_DIM, mae_ckpt=_Path("output/mae_encoder.pth")).to(device)
+    else:
+        m = DefectClassifier(num_classes, EMBED_DIM).to(device)
+    m.load_state_dict(state_dict)
+    m.eval()
+    return m
+
 # ─────────────────────────────────────────────────────────────────────────────
 CHECKPOINT       = Path(__file__).parent / "output" / "model_best.pth"
 CHECKPOINT_S1    = Path(__file__).parent / "output" / "model_stage1.pth"
@@ -48,25 +67,25 @@ _PREPROCESS = transforms.Compose([
     transforms.Normalize(_MEAN, _STD),
 ])
 
-_TTA_TRANSFORMS = [
-    transforms.Compose([
+def _make_tta_transforms():
+    """8 deterministic TTA variants: original + 3 rotations + 4 flips."""
+    base = [
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(_MEAN, _STD),
-    ]),
-    transforms.Compose([
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
-        transforms.RandomHorizontalFlip(p=1.0),
-        transforms.ToTensor(),
-        transforms.Normalize(_MEAN, _STD),
-    ]),
-    transforms.Compose([
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
-        transforms.RandomVerticalFlip(p=1.0),
-        transforms.ToTensor(),
-        transforms.Normalize(_MEAN, _STD),
-    ]),
-]
+    ]
+    post = [transforms.ToTensor(), transforms.Normalize(_MEAN, _STD)]
+    variants = []
+    for angle in [0, 90, 180, 270]:
+        for flip in [False, True]:
+            ops = base.copy()
+            if angle:
+                ops.append(transforms.Lambda(lambda img, a=angle: img.rotate(a)))
+            if flip:
+                ops.append(transforms.RandomHorizontalFlip(p=1.0))
+            ops.extend(post)
+            variants.append(transforms.Compose(ops))
+    return variants
+
+_TTA_TRANSFORMS = _make_tta_transforms()   # 8 variants
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,9 +301,7 @@ class CascadeClassificationApp:
 
         # ── Stage 1 ──────────────────────────────────────────────────────────
         ckpt1 = torch.load(stage1_path, map_location=self.device, weights_only=False)
-        self.model1 = DefectClassifier(num_classes=2, embed_dim=EMBED_DIM).to(self.device)
-        self.model1.load_state_dict(ckpt1["model_state"])
-        self.model1.eval()
+        self.model1 = _load_model(2, ckpt1["model_state"], self.device)
         self.threshold = ckpt1.get("threshold", 0.35)
         _DEFECT_IDX = 1
 
@@ -292,11 +309,7 @@ class CascadeClassificationApp:
         ckpt2 = torch.load(stage2_path, map_location=self.device, weights_only=False)
         self.defect_classes = ckpt2["classes"]        # 8 defect types
         self.defect2idx     = ckpt2["class2idx"]
-        self.model2 = DefectClassifier(
-            num_classes=len(self.defect_classes), embed_dim=EMBED_DIM
-        ).to(self.device)
-        self.model2.load_state_dict(ckpt2["model_state"])
-        self.model2.eval()
+        self.model2 = _load_model(len(self.defect_classes), ckpt2["model_state"], self.device)
         self.protos2 = ckpt2["prototypes"].to(self.device)  # (8, D)
 
         # Full class list for output consistency
@@ -312,11 +325,16 @@ class CascadeClassificationApp:
     def predict(self, image_path: str | Path) -> dict:
         t0  = time.time()
         img = Image.open(image_path).convert("RGB")
-        t   = _PREPROCESS(img).unsqueeze(0).to(self.device)
 
-        # Stage 1: good or defective?
-        logits1, _ = self.model1(t)
-        defect_prob = F.softmax(logits1, dim=1)[0, 1].item()
+        # Stage 1 TTA: average defect_prob across all 8 variants
+        defect_probs = []
+        tensors = []
+        for tf in _TTA_TRANSFORMS:
+            t = tf(img).unsqueeze(0).to(self.device)
+            tensors.append(t)
+            logits1, _ = self.model1(t)
+            defect_probs.append(F.softmax(logits1, dim=1)[0, 1].item())
+        defect_prob = float(np.mean(defect_probs))
 
         if defect_prob < self.threshold:
             pred_class = "good"
@@ -325,8 +343,9 @@ class CascadeClassificationApp:
                           **{c: round(defect_prob / len(self.defect_classes), 4)
                              for c in self.defect_classes}}
         else:
-            # Stage 2: which defect type?
-            embed2      = self.model2.get_embedding(t)
+            # Stage 2 TTA: average embeddings across all 8 variants
+            embeds2 = [self.model2.get_embedding(t) for t in tensors]
+            embed2  = F.normalize(torch.stack(embeds2).mean(0), dim=1)
             sims        = F.softmax(torch.mm(embed2, self.protos2.T) * 12, dim=1).squeeze(0)
             pred_idx    = sims.argmax().item()
             pred_class  = self.defect_classes[pred_idx]

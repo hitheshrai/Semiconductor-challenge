@@ -53,10 +53,15 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, str(Path(__file__).parent))
 from model import DefectClassifier, compute_prototypes, EMBED_DIM
 
-# ViT backbone — imported lazily so train_cascade works without MAE checkpoint
-_USE_VIT = False
+# Backbone selector — set by CLI flags before training starts
+_USE_VIT    = False
+_USE_DINOV2 = False
+
 def _make_model(num_classes: int):
-    """Model factory — returns ViTDefectClassifier if --vit, else DefectClassifier."""
+    """Model factory — backbone selected by --vit / --dinov2 flag."""
+    if _USE_DINOV2:
+        from model_dinov2 import DINOv2DefectClassifier
+        return DINOv2DefectClassifier(num_classes, EMBED_DIM)
     if _USE_VIT:
         from model_vit import ViTDefectClassifier
         from train_mae import MAE_CKPT
@@ -563,15 +568,22 @@ def main():
     ap.add_argument("--vit", action="store_true",
                     help="Use MAE-pretrained ViT-Small backbone instead of EfficientNet-B0. "
                          "Requires train_mae.py to have been run first.")
+    ap.add_argument("--dinov2", action="store_true",
+                    help="Use DINOv2 ViT-Small/14 pretrained backbone (timm). "
+                         "Highest-quality features for prototype/cosine inference.")
     args = ap.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    if args.vit:
-        import train_cascade as _self
-        _self._USE_VIT = True
+    if args.dinov2:
+        global _USE_DINOV2
+        _USE_DINOV2 = True
+        print("Backbone: DINOv2 ViT-Small/14 (pretrained)")
+    elif args.vit:
+        global _USE_VIT
+        _USE_VIT = True
         print("Backbone: MAE-pretrained ViT-Small/16")
 
     if args.evaluate:

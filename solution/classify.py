@@ -337,7 +337,7 @@ class CascadeClassificationApp:
         t0  = time.time()
         img = Image.open(image_path).convert("RGB")
 
-        # Stage 1 TTA: average defect_prob across all 8 variants
+        # Stage 1 TTA: average defect_prob across all 4 flip variants
         defect_probs = []
         tensors = []
         for tf in _TTA_TRANSFORMS:
@@ -389,7 +389,7 @@ class CascadeClassificationApp:
                               **{c: round(defect_prob / len(self.defect_classes), 4)
                                  for c in self.defect_classes}}
         else:
-            # Stage 2 TTA: average embeddings across all 8 variants
+            # Stage 2 TTA: average embeddings across all 4 flip variants
             embeds2 = [self.model2.get_embedding(t) for t in tensors]
             embed2  = F.normalize(torch.stack(embeds2).mean(0), dim=1)
             sims        = F.softmax(torch.mm(embed2, self.protos2.T) * 12, dim=1).squeeze(0)

@@ -553,7 +553,7 @@ def main():
             device, val_samples, all_samples = load_cascade_and_data()
 
         use_tta = not args.no_tta
-        print(f"\nRunning cascade predictions (TTA={'8×' if use_tta else 'off'}) …")
+        print(f"\nRunning cascade predictions (TTA={'4× flip' if use_tta else 'off'}) …")
         true_l, pred_l, probs = predict_all_cascade(
             model1, model2, threshold, prototypes, rescue_tau, rescue_floor,
             rescue_idx, val_samples, device, use_tta=use_tta

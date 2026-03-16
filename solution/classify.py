@@ -312,6 +312,11 @@ class CascadeClassificationApp:
         self.model2 = _load_model(len(self.defect_classes), ckpt2["model_state"], self.device)
         self.protos2 = ckpt2["prototypes"].to(self.device)  # (8, D)
 
+        # defect8 rescue path (tuned via --tune-rescue)
+        self.rescue_tau   = ckpt2.get("defect8_rescue_threshold", None)
+        self.rescue_floor = ckpt2.get("defect8_rescue_floor",     0.0)
+        self.rescue_idx   = ckpt2.get("defect8_rescue_idx",       None)
+
         # Full class list for output consistency
         self.classes   = self.defect_classes + ["good"]
         self.extra_classes = []
@@ -319,6 +324,8 @@ class CascadeClassificationApp:
         self._load_ms = (time.time() - t0) * 1000
         print(f"Cascade loaded in {self._load_ms:.0f} ms  |  device={self.device}")
         print(f"Stage 1 threshold: {self.threshold:.2f}")
+        if self.rescue_tau is not None:
+            print(f"defect8 rescue   : floor={self.rescue_floor:.2f}, τ={self.rescue_tau:.2f}")
         print(f"Defect classes: {self.defect_classes}")
 
     @torch.no_grad()
@@ -337,11 +344,29 @@ class CascadeClassificationApp:
         defect_prob = float(np.mean(defect_probs))
 
         if defect_prob < self.threshold:
-            pred_class = "good"
-            confidence = 1.0 - defect_prob
-            scores     = {"good": round(confidence, 4),
-                          **{c: round(defect_prob / len(self.defect_classes), 4)
-                             for c in self.defect_classes}}
+            # defect8 rescue: compound condition — suspicion floor + proto similarity
+            rescue_fired = False
+            if self.rescue_tau is not None and defect_prob >= self.rescue_floor:
+                embeds2_rescue = [self.model2.get_embedding(t) for t in tensors]
+                embed2_rescue  = F.normalize(torch.stack(embeds2_rescue).mean(0), dim=1)
+                d8_sim = torch.mm(embed2_rescue,
+                                  self.protos2[self.rescue_idx].unsqueeze(1)).item()
+                if d8_sim >= self.rescue_tau:
+                    pred_class  = self.defect_classes[self.rescue_idx]
+                    confidence  = round(d8_sim, 4)
+                    scores      = {c: round(
+                                      torch.mm(embed2_rescue,
+                                               self.protos2[i].unsqueeze(1)).item(), 4)
+                                   for i, c in enumerate(self.defect_classes)}
+                    scores["good"] = round(1.0 - defect_prob, 4)
+                    rescue_fired = True
+
+            if not rescue_fired:
+                pred_class = "good"
+                confidence = 1.0 - defect_prob
+                scores     = {"good": round(confidence, 4),
+                              **{c: round(defect_prob / len(self.defect_classes), 4)
+                                 for c in self.defect_classes}}
         else:
             # Stage 2 TTA: average embeddings across all 8 variants
             embeds2 = [self.model2.get_embedding(t) for t in tensors]

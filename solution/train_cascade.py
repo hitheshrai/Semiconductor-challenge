@@ -453,8 +453,136 @@ def _report_stage2(device):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cascade evaluation
+# defect8 rescue — cosine similarity override for Stage-1 false negatives
 # ─────────────────────────────────────────────────────────────────────────────
+def tune_defect8_rescue(device):
+    """Find the best defect8 rescue threshold using a compound condition.
+
+    Compound rescue: Stage1 predicts 'good' BUT Stage1 defect_prob >= suspicion_floor
+                     AND cosine_sim(embed, defect8_proto) >= rescue_tau.
+
+    The suspicion_floor filters out images Stage1 is very confident are "good"
+    (defect_prob < 0.20), dramatically reducing good false positives.
+
+    Selection criterion: maximise balanced_accuracy (per-class recall average).
+    Saves best (suspicion_floor, rescue_tau) to model_stage2.pth.
+    """
+    print(f"\n{'='*60}")
+    print(f" defect8 Rescue Threshold Sweep (compound condition)")
+    print(f"{'='*60}")
+
+    if not CKPT_STAGE1.exists() or not CKPT_STAGE2.exists():
+        print("ERROR: Need both checkpoints.")
+        return
+
+    ckpt1     = torch.load(CKPT_STAGE1, map_location=device, weights_only=False)
+    model1    = _make_model(2).to(device); model1.load_state_dict(ckpt1["model_state"]); model1.eval()
+    s1_thresh = ckpt1.get("threshold", 0.65)
+
+    ckpt2    = torch.load(CKPT_STAGE2, map_location=device, weights_only=False)
+    model2   = _make_model(NUM_DEFECTS).to(device); model2.load_state_dict(ckpt2["model_state"]); model2.eval()
+    protos2  = ckpt2["prototypes"].to(device)
+
+    d8_idx       = DEFECT_CLASSES.index("defect8")
+    d8_proto     = protos2[d8_idx]
+    good_idx_all = ALL_CLASSES.index("good")
+    d8_idx_all   = ALL_CLASSES.index("defect8")
+
+    # Build val set
+    all_samples = []
+    for cls in ALL_CLASSES:
+        d = DATASET_DIR / cls
+        if not d.exists(): continue
+        lbl = ALL_CLASSES.index(cls)
+        for f in d.iterdir():
+            if f.suffix.upper() in {".PNG", ".JPG", ".JPEG"}:
+                all_samples.append((str(f), lbl))
+    paths, labels = zip(*all_samples)
+    _, va_p, _, va_l = train_test_split(paths, labels, test_size=0.2,
+                                        stratify=labels, random_state=SEED)
+    tf = get_transform(False)
+
+    # Collect (defect_prob, d8_sim, true_label) for all Stage-1 "good" predictions
+    entries = []
+    with torch.no_grad():
+        for path, true_lbl in zip(va_p, va_l):
+            img = tf(Image.open(path).convert("RGB")).unsqueeze(0).to(device)
+            logits1, _ = model1(img)
+            dp = F.softmax(logits1, dim=1)[0, DEFECT_IDX].item()
+            if dp < s1_thresh:
+                embed2 = F.normalize(model2.get_embedding(img), dim=1)
+                sim    = torch.mm(embed2, d8_proto.unsqueeze(1)).item()
+                entries.append((dp, sim, true_lbl))
+
+    d8_val_total = sum(1 for _, l in zip(va_p, va_l) if l == d8_idx_all)
+    good_val_total = sum(1 for _, l in zip(va_p, va_l) if l == good_idx_all)
+    d8_missed = sum(1 for dp, sim, lbl in entries if lbl == d8_idx_all)
+    d8_caught  = d8_val_total - d8_missed
+
+    print(f"\n  Stage-1 summary:")
+    print(f"    defect8 val total : {d8_val_total}")
+    print(f"    defect8 caught    : {d8_caught}  (Stage 1 defect_prob >= {s1_thresh:.2f})")
+    print(f"    defect8 missed    : {d8_missed}  (Stage 1 predicted 'good' — rescue targets these)")
+    print(f"\n  defect8 Stage-1 defect_prob values for MISSED images:")
+    for dp, sim, lbl in sorted(entries, key=lambda x: -x[1]):
+        if lbl == d8_idx_all:
+            print(f"    defect_prob={dp:.3f}  d8_sim={sim:.3f}")
+
+    print(f"\n  Compound sweep: suspicion_floor × rescue_tau")
+    print(f"\n  {'floor':>7} {'τ':>6}  {'d8_rescued':>10}  {'d8_recall':>10}  {'good_fp':>8}  {'Δbal_acc':>10}")
+    print("  " + "-"*64)
+
+    base_d8_recall   = d8_caught / max(d8_val_total, 1)
+    base_good_recall = good_val_total / good_val_total  # 1.0 before rescue modifies it
+    # (actual good recall from full cascade is ~0.877 — rescue only affects the "good" arm)
+    # For Δbal_acc comparison we only need the delta from rescue entries
+
+    best_bal_delta = 0.0
+    best_tau = None
+    best_floor = None
+
+    for floor in [0.0, 0.10, 0.20, 0.30, 0.40]:
+        for tau in [t / 100 for t in range(95, 49, -5)]:
+            rescued = sum(1 for dp, sim, lbl in entries
+                          if dp >= floor and sim >= tau and lbl == d8_idx_all)
+            fp      = sum(1 for dp, sim, lbl in entries
+                          if dp >= floor and sim >= tau and lbl == good_idx_all)
+            # Delta balanced accuracy: each defect8 rescued = +1/(d8_val_total * n_classes)
+            #                          each good FP           = -1/(good_val_total * n_classes)
+            n_cls   = len(ALL_CLASSES)
+            delta   = rescued / (d8_val_total * n_cls) - fp / (good_val_total * n_cls)
+            if rescued > 0 or fp == 0:
+                print(f"  {floor:7.2f} {tau:6.2f}  {rescued:>10}  "
+                      f"{(d8_caught + rescued) / d8_val_total:>10.3f}  "
+                      f"{fp:>8}  {delta:>10.5f}")
+            if delta > best_bal_delta:
+                best_bal_delta = delta
+                best_tau       = tau
+                best_floor     = floor
+
+    if best_tau is None:
+        print("\n  No rescue configuration improves balanced accuracy.")
+        print("  defect8 embedding overlaps too heavily with 'good' in DINOv2 feature space.")
+        print("  Recommendation: try One-Class SVM (approach 2) or accept current recall.")
+        return
+
+    print(f"\n  Best compound threshold: floor={best_floor:.2f}, τ={best_tau:.2f}")
+    rescued_final = sum(1 for dp, sim, lbl in entries
+                        if dp >= best_floor and sim >= best_tau and lbl == d8_idx_all)
+    fp_final      = sum(1 for dp, sim, lbl in entries
+                        if dp >= best_floor and sim >= best_tau and lbl == good_idx_all)
+    print(f"  defect8 recall: {(d8_caught + rescued_final) / d8_val_total:.1%}  "
+          f"({d8_caught + rescued_final}/{d8_val_total})  was {d8_caught}/{d8_val_total}")
+    print(f"  good FPs added: {fp_final}  ({fp_final / good_val_total:.1%} of good val set)")
+    print(f"  Δ balanced acc: +{best_bal_delta:.5f}")
+
+    ckpt2["defect8_rescue_threshold"]   = float(best_tau)
+    ckpt2["defect8_rescue_floor"]       = float(best_floor)
+    ckpt2["defect8_rescue_idx"]         = int(d8_idx)
+    torch.save(ckpt2, CKPT_STAGE2)
+    print(f"  Saved → {CKPT_STAGE2}")
+
+
 def evaluate_cascade(device):
     print(f"\n{'='*60}")
     print(f" Cascade Evaluation")
@@ -478,7 +606,13 @@ def evaluate_cascade(device):
     model2.eval()
     protos2 = ckpt2["prototypes"].to(device)
 
+    rescue_tau   = ckpt2.get("defect8_rescue_threshold", None)
+    rescue_floor = ckpt2.get("defect8_rescue_floor",     0.0)
+    rescue_idx   = ckpt2.get("defect8_rescue_idx",       None)
+
     print(f"  Stage 1 threshold: {threshold:.2f}")
+    if rescue_tau is not None:
+        print(f"  defect8 rescue   : floor={rescue_floor:.2f}, τ={rescue_tau:.2f}  (idx {rescue_idx})")
 
     # Build val set from ALL classes
     all_samples = []
@@ -508,7 +642,16 @@ def evaluate_cascade(device):
             defect_prob = F.softmax(logits1, dim=1)[0, DEFECT_IDX].item()
 
             if defect_prob < threshold:
-                pred = good_idx_all
+                # defect8 rescue: compound condition — suspicion floor + proto similarity
+                if rescue_tau is not None and defect_prob >= rescue_floor:
+                    embed2 = F.normalize(model2.get_embedding(img), dim=1)
+                    d8_sim = torch.mm(embed2, protos2[rescue_idx].unsqueeze(1)).item()
+                    if d8_sim >= rescue_tau:
+                        pred = ALL_CLASSES.index(DEFECT_CLASSES[rescue_idx])
+                    else:
+                        pred = good_idx_all
+                else:
+                    pred = good_idx_all
             else:
                 # Stage 2: which defect type?
                 embed2 = model2.get_embedding(img)
@@ -563,6 +706,8 @@ def main():
                     help="Which stage to train (default: both)")
     ap.add_argument("--evaluate", action="store_true",
                     help="Evaluate cascade on val set (requires both checkpoints)")
+    ap.add_argument("--tune-rescue", action="store_true",
+                    help="Sweep defect8 rescue threshold and save to model_stage2.pth")
     ap.add_argument("--stage1-epochs", type=int, default=30)
     ap.add_argument("--stage2-epochs", type=int, default=40)
     ap.add_argument("--vit", action="store_true",
@@ -585,6 +730,10 @@ def main():
         global _USE_VIT
         _USE_VIT = True
         print("Backbone: MAE-pretrained ViT-Small/16")
+
+    if args.tune_rescue:
+        tune_defect8_rescue(device)
+        return
 
     if args.evaluate:
         evaluate_cascade(device)

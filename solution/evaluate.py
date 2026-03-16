@@ -121,6 +121,9 @@ def load_cascade_and_data(stage1_path=CKPT_STAGE1, stage2_path=CKPT_STAGE2):
     ckpt2 = torch.load(stage2_path, map_location=device, weights_only=False)
     model2 = _auto_load_model(len(_DEFECT_CLASSES), ckpt2["model_state"], device)
     prototypes = ckpt2["prototypes"].to(device)
+    rescue_tau   = ckpt2.get("defect8_rescue_threshold", None)
+    rescue_floor = ckpt2.get("defect8_rescue_floor",     0.0)
+    rescue_idx   = ckpt2.get("defect8_rescue_idx",       None)
 
     # Rebuild dataset with ALL_CLASSES ordering from train_cascade.py
     all_samples = []
@@ -140,12 +143,15 @@ def load_cascade_and_data(stage1_path=CKPT_STAGE1, stage2_path=CKPT_STAGE2):
     val_samples = list(zip(va_p, va_l))
 
     print(f"Device: {device}  |  Stage 1 threshold: {threshold:.2f}")
+    if rescue_tau is not None:
+        print(f"defect8 rescue   : floor={rescue_floor:.2f}, τ={rescue_tau:.2f}")
     print(f"All samples: {len(all_samples)}  |  Val set: {len(val_samples)}")
-    return model1, model2, threshold, prototypes, device, val_samples, all_samples
+    return model1, model2, threshold, prototypes, rescue_tau, rescue_floor, rescue_idx, device, val_samples, all_samples
 
 
 @torch.no_grad()
-def predict_all_cascade(model1, model2, threshold, prototypes, val_samples, device, use_tta=True):
+def predict_all_cascade(model1, model2, threshold, prototypes, rescue_tau, rescue_floor,
+                        rescue_idx, val_samples, device, use_tta=True):
     """Two-stage cascade prediction.  Returns (true_l, pred_l, probs [N x 9])."""
     tta_transforms = _make_tta_transforms() if use_tta else None
     val_tf = transforms.Compose([
@@ -172,27 +178,39 @@ def predict_all_cascade(model1, model2, threshold, prototypes, val_samples, devi
             logits1, _ = model1(img_t)
             defect_prob = F.softmax(logits1, dim=1)[0, _DEFECT_IDX_BIN].item()
 
+        # Compute Stage 2 embedding once (needed for rescue and for defect typing)
+        if use_tta:
+            emb_list = []
+            for tf in tta_transforms:
+                img_t = tf(img_pil).unsqueeze(0).to(device)
+                emb_list.append(model2.get_embedding(img_t))
+            embed2 = F.normalize(torch.stack(emb_list).mean(0), dim=1)
+        else:
+            img_t = val_tf(img_pil).unsqueeze(0).to(device)
+            embed2 = model2.get_embedding(img_t)
+
         # Build full probability vector (for ROC curves)
         probs = np.zeros(n_classes)
 
         if defect_prob < threshold:
+            # defect8 rescue: compound condition — suspicion floor + proto similarity
+            if rescue_tau is not None and defect_prob >= rescue_floor:
+                d8_sim = torch.mm(embed2, prototypes[rescue_idx].unsqueeze(1)).item()
+                if d8_sim >= rescue_tau:
+                    pred = _CASCADE_CLASSES.index(_DEFECT_CLASSES[rescue_idx])
+                    probs[_GOOD_IDX_ALL] = 1.0 - defect_prob
+                    for j, dc in enumerate(_DEFECT_CLASSES):
+                        probs[_CASCADE_CLASSES.index(dc)] = max(0.0,
+                            torch.mm(embed2, prototypes[j].unsqueeze(1)).item())
+                    all_true.append(true_lbl); all_pred.append(pred); all_probs.append(probs)
+                    continue
             pred = _GOOD_IDX_ALL
             probs[_GOOD_IDX_ALL] = 1.0 - defect_prob
             for j in range(n_classes):
                 if j != _GOOD_IDX_ALL:
                     probs[j] = defect_prob / len(_DEFECT_CLASSES)
         else:
-            # Stage 2 — TTA-averaged embedding → cosine similarity → prototype
-            if use_tta:
-                emb_list = []
-                for tf in tta_transforms:
-                    img_t = tf(img_pil).unsqueeze(0).to(device)
-                    emb_list.append(model2.get_embedding(img_t))
-                embed2 = F.normalize(torch.stack(emb_list).mean(0), dim=1)
-            else:
-                img_t = val_tf(img_pil).unsqueeze(0).to(device)
-                embed2 = model2.get_embedding(img_t)
-
+            # Stage 2 — use already-computed embed2
             sims = torch.mm(embed2, prototypes.T).squeeze(0)   # (8,)
             stage2_probs = F.softmax(sims * 10, dim=0).cpu().numpy()
             defect_pred_idx = int(sims.argmax().item())
@@ -527,14 +545,14 @@ def main():
     if args.cascade:
         # ── Cascade path (DINOv2 two-stage) ─────────────────────────────────
         print("Loading DINOv2 two-stage cascade …")
-        model1, model2, threshold, prototypes, device, val_samples, all_samples = \
-            load_cascade_and_data()
+        model1, model2, threshold, prototypes, rescue_tau, rescue_floor, rescue_idx, \
+            device, val_samples, all_samples = load_cascade_and_data()
 
         use_tta = not args.no_tta
         print(f"\nRunning cascade predictions (TTA={'8×' if use_tta else 'off'}) …")
-        print("  (this may take several minutes with TTA on CPU)")
         true_l, pred_l, probs = predict_all_cascade(
-            model1, model2, threshold, prototypes, val_samples, device, use_tta=use_tta
+            model1, model2, threshold, prototypes, rescue_tau, rescue_floor,
+            rescue_idx, val_samples, device, use_tta=use_tta
         )
         classes = _CASCADE_CLASSES
         class2idx = {c: i for i, c in enumerate(classes)}

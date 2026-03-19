@@ -1,7 +1,7 @@
 # Few-Shot Semiconductor Defect Classification
 
 **ASU / Intel Semiconductor Solutions Challenge 2026 — Problem A**
-*Hithesh Vurukonda — March 2026*
+*Hithesh Rai Purushothama — March 2026*
 
 ---
 
@@ -98,7 +98,7 @@ We evaluated three backbone families:
 | ViT-Small/16 + MAE | Wafer domain (~300 ep) | 0.780 | Domain adaptation, marginal gain |
 | **DINOv2 ViT-Small/14** | **142M images, self-supervised** | **0.909** | Best; CLS token designed for clustering |
 
-**DINOv2** (Oquab et al., 2023, Meta AI) uses joint DINO and iBOT self-supervised objectives to train a Vision Transformer on 142 million curated images. The resulting CLS token embeddings exhibit strong clustering properties under cosine similarity — they are specifically designed to be semantically meaningful without a downstream classification head. NVIDIA reports 98.5% accuracy on die-level semiconductor defect inspection using DINOv2 as a backbone.
+**DINOv2** (Oquab et al., 2023, Meta AI) uses joint DINO and iBOT self-supervised objectives to train a Vision Transformer on 142 million curated images. The resulting CLS token embeddings exhibit strong clustering properties under cosine similarity — they are specifically designed to be semantically meaningful without a downstream classification head.
 
 The superior performance of DINOv2 over domain-pretrained MAE (ViT/16 + 300 epochs on wafer images) reflects the importance of pretraining scale: 142M diverse images produce richer transferable representations than ~3,500 domain-specific wafer images at this dataset size.
 

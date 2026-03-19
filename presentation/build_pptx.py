@@ -206,7 +206,7 @@ add_textbox(slide, MARGIN, Inches(3.7), CONTENT_W, Inches(0.4),
             font_size=15, italic=True, color=RGBColor(0xAA, 0xCC, 0xFF),
             align=PP_ALIGN.CENTER)
 add_textbox(slide, MARGIN, Inches(5.5), CONTENT_W, Inches(0.4),
-            "Hithesh Vurukonda  ·  March 2026",
+            "Hithesh Rai Purushothama  ·  March 2026",
             font_size=14, color=RGBColor(0xCC, 0xE5, 0xFF), align=PP_ALIGN.CENTER)
 
 
@@ -332,9 +332,8 @@ top = add_two_col_table(
     [
         ["Pretraining data",          "~14M labelled",   "142M unlabelled"],
         ["CLS token quality",         "Moderate",        "Excellent for clustering"],
-        ["Few-shot defect benchmarks","Baseline",        "+5–8% bal. acc."],
         ["Cosine similarity alignment","Partial",         "Direct"],
-        ["NVIDIA semiconductor AUC",  "—",               "98.5% die-level accuracy"],
+        ["Cascade bal. acc. (this work)","0.781 (EfficientNet)", "0.909 (DINOv2)"],
     ],
     col_widths=[Inches(3.8), Inches(3.2), Inches(3.2)], font_size=15
 )

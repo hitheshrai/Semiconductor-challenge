@@ -22,7 +22,7 @@ style: |
 
 Two-Stage Cascade · DINOv2 · Prototype Inference
 
-*Hithesh Vurukonda*
+*Hithesh Rai Purushothama*
 *March 2026*
 
 ---
@@ -107,10 +107,8 @@ DINOv2 (Meta AI, 2023) is pretrained on **142M diverse images** using self-super
 |----------|-----------|--------|
 | Pretraining data | ~14M labelled | 142M unlabelled |
 | CLS token quality | Moderate | Excellent for clustering |
-| Few-shot defect benchmarks | Baseline | +5–8% bal. acc. |
 | Cosine similarity alignment | Partial | Direct |
-
-NVIDIA reports **98.5% accuracy on die-level defect inspection** using DINOv2.
+| Cascade bal. acc. (this work) | 0.781 (EfficientNet) | **0.909** |
 
 The CLS token embedding is specifically designed to **cluster visually similar patches** — ideal for prototype-based inference on rare defect classes.
 
